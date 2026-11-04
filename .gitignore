@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .dsh-office-*
+.jupyter_data/
+benchmarks/

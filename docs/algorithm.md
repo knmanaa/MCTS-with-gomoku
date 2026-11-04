@@ -1048,3 +1048,210 @@ move).
 They can be overridden from outside **without editing the code** (e.g.
 `project_skeleton.MCTS_TIME_LIMIT = 0.15` for fast benchmark games); the
 defaults apply when the names are not defined.
+
+---
+
+# Performance optimisation (v3)
+
+The search is budget-bound: the strength of the move is (almost) proportional
+to how many simulations fit into the 4.7 s. Profiling the v2 engine found the
+budget split as follows (mid-game positions):
+
+| Component | Share of the 4.7 s |
+| --- | --- |
+| Rollouts (total) | ~60–80 % |
+| — static evaluator at the 32-ply cutoff | ~27–31 % |
+| — win checks inside the playout | ~18–26 % |
+| — playout stepping (pick/place) | ~25 % |
+| PUCT selection | ~13–26 % |
+| Expansion (priors) | ~2–12 % |
+| `create_child` | ~2 % |
+| Root tactical scans (win-in-1, M/F/O) | ~0.1 % |
+
+So three things were worth attacking: the **win check** (called 4× per
+playout ply), the **static evaluator** (once per simulation, a full-board
+scan), and small per-simulation overheads (empty-cell lists, random draws,
+the full-board draw test). The v2 root tactical layer turned out to be free
+and was left alone.
+
+## Measured result
+
+Identical positions (same seed, same stone placements and edges), identical
+simulation counter injected into both builds, full 4.7 s budget:
+
+| Position | v2 (sims/s) | v3 / HEAD (sims/s) | Speed-up |
+| --- | --- | --- | --- |
+| empty board | 2,628 | **3,765** | **+43 %** |
+| early game (12 stones) | 1,518 | **1,994** | **+31%** |
+| black open three (search case) | 1,973 | **2,247** | **+14%** |
+
+(An older measurement quoting ~7,000 sims/s predates v2's open-four threat
+layer and openness-aware evaluator; only the HEAD-vs-v2 table above is
+apples-to-apples.)
+
+### Why not more?
+
+The remaining cost is irreducible *in pure Python* without changing the
+algorithm: every simulation must play out up to 32 plies and evaluate the
+leaf. The micro-optimisation wins came from removing per-call indirection
+(function calls, list rebuilds) rather than from changing the algorithm —
+which is exactly what the rules allow (only the three required functions may
+be changed, no extra imports).
+
+## Optimisation 1 — gated win check
+
+`win_check` used to call `line_len` in all four directions for every stone
+placed during a playout, even though the vast majority of placements have
+**no same-colour neighbour** in most directions (the walk exits immediately,
+but the call overhead remains). The fix is a precomputed **gate table** plus
+inlined edge lookups:
+
+```python
+    # flat edge lists (for inlined lookups in the hot loops):
+    #   ehF[r*(n_cols-1)+c] = edge (r,c)-(r,c+1)
+    #   evF[r*n_cols+c]     = edge (r,c)-(r+1,c)
+    ncm1 = n_cols - 1
+    EH_SIZE = n_rows * ncm1
+    ehF = np.asarray(state[1]).astype(bool).ravel().tolist()
+    evF = np.asarray(state[2]).astype(bool).ravel().tolist()
+    edges = ehF + evF                   # gate table indices point into this
+
+    def _edge_idx(r, c, dr, dc):
+        """Index into `edges` for the edge (r,c)->(r+dr,c+dc); -1 = diagonal."""
+        if dr == 0 and dc == 1:
+            return r * ncm1 + c
+        if dr == 0 and dc == -1:
+            return r * ncm1 + c - 1
+        if dr == 1 and dc == 0:
+            return EH_SIZE + r * n_cols + c
+        if dr == -1 and dc == 0:
+            return EH_SIZE + (r - 1) * n_cols + c
+        return -1                       # |dr| == |dc| == 1: diagonal, always linked
+
+    # per-cell gate table for the win check: for each of the four directions,
+    # (dr, dc, fwd neighbour, fwd edge, bwd neighbour, bwd edge); -1 marks
+    # out-of-bounds neighbours / diagonal directions (no edge needed)
+    gates4 = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            entries = []
+            for dr, dc in DIRS4:
+                fr, fc = r + dr, c + dc
+                if 0 <= fr < n_rows and 0 <= fc < n_cols:
+                    fnb, fe = fr * n_cols + fc, _edge_idx(r, c, dr, dc)
+                else:
+                    fnb, fe = -1, -1
+                br, bc = r - dr, c - dc
+                if 0 <= br < n_rows and 0 <= bc < n_cols:
+                    bnb, be = br * n_cols + bc, _edge_idx(br, bc, dr, dc)
+                else:
+                    bnb, be = -1, -1
+                entries.append((dr, dc, fnb, fe, bnb, be))
+            gates4.append(tuple(entries))
+
+    def win_check(bd, a):
+        """Exact win check for the stone at flat index `a`, with a cheap
+        neighbour gate: a direction can only hold a line of >= 2 stones if
+        the immediate neighbour through a live connection is ours, so the
+        full two-way walk runs only for directions that pass the gate."""
+        color = bd[a]
+        r, c = divmod(a, n_cols)
+        for dr, dc, fnb, fe, bnb, be in gates4[a]:
+            fwd = fnb >= 0 and bd[fnb] == color and (fe < 0 or edges[fe])
+            bwd = bnb >= 0 and bd[bnb] == color and (be < 0 or edges[be])
+            if (fwd or bwd) and line_len(bd, r, c, dr, dc) == 5:
+                return True
+        return False
+```
+
+The gate is **exact**, not an approximation: any five-in-a-row through `a`
+must contain a same-colour neighbour of `a` along the line, joined by a live
+connection. So a direction whose two adjacent cells fail the gate cannot hold
+a win, and skipping it loses nothing.
+
+## Optimisation 2 — inlined edge lookups in the static evaluator
+
+`static_eval` runs once per simulation and scans every stone in four
+directions, calling `conn()` at every start check, every walk step and every
+playable-end check (hundreds of calls per evaluation). The rewrite inlines
+the edge lookups using the flat edge lists:
+
+```python
+                # behind cell is the same colour: this is the start of a
+                # line only if the connecting edge is missing
+                if dr == 0:
+                    if ehF[br * ncm1 + (bc if dc == 1 else bc - 1)]:
+                        continue
+                elif dc == 0:
+                    if evF[(br if dr == 1 else br - 1) * n_cols + bc]:
+                        continue
+                else:
+                    continue    # diagonal behind: always connected
+```
+
+The formula for $\Phi_x$ (and therefore $V(s)$) is unchanged — only the
+plumbing is. Three traps in this transcription, each of which produced a
+silently wrong evaluation before being caught by the property test:
+
+1. **The start check must be "skip iff behind is the same colour AND
+   connected"**, not "skip iff behind is different" (an inverted condition
+   silently skips every run that starts in the open).
+2. **Branch on both `dr` and `dc`.** An `elif dr == 1:` branch fires for the
+   anti-diagonal `(1, -1)` too, turning "diagonals are always connected" into
+   a vertical-edge lookup — the same bug that once broke `conn()`.
+3. **An edge belongs to the left/upper cell.** The edge after a run is
+   indexed by the run's last cell, not by the extension cell.
+
+## Optimisation 3 — per-simulation bookkeeping
+
+```python
+    class Node:
+        __slots__ = ('board', 'player', 'children', 'untried', 'prior',
+                     'N', 'W', 'Q', 'terminal_value', 'empties')
+
+    def create_child(node, a):
+        r, c = divmod(a, n_cols)
+        bd = node.board[:]              # copy; the parent's board is reused
+        bd[a] = node.player
+        child = Node(bd, -node.player)
+        child.empties = [i for i in node.empties if i != a]
+        if win_check(bd, a):
+            child.terminal_value = -1.0                          # mover won
+        elif not child.empties:
+            child.terminal_value = 1.0 if child.player == WHITE else -1.0
+        return child
+```
+
+- **Empty-cell lists are carried on the node** (`child.empties`), so the
+  rollout no longer rescans all 221 cells, `expand` reuses the list instead
+  of rebuilding it, and the **draw test becomes O(1)** (`not child.empties`)
+  instead of `0 not in bd` over the whole board.
+- **Random numbers are drawn in larger batches** (`RBN = max(4096, ...)`), so
+  the generator is consulted roughly once per hundred rollouts instead of
+  once per 32 plies.
+- The root still stores the **full** empty set (`root.empties`) while its
+  `untried` list may be the restricted $F \cup O$ set — the two serve
+  different purposes (rollouts vs. action restriction).
+
+## Correctness safeguards
+
+The optimisations touch the two hottest correctness-critical routines, so they
+are guarded by:
+
+1. **A property test** comparing the optimised `win_check` and `static_eval`
+   against a from-scratch reference implementation over random boards:
+   **0 evaluation mismatches and 0 win-check mismatches in 3,676 checks**.
+2. **The behavioural suites**: `check_result` cases, the diagonal regression
+   (all four directions, `edgeV` all False and all True), the open-three /
+   open-four threat suite (including the forced-win $M$ case and the
+   double-threat resistance), the MCTS–vs–random games, and the self-play
+   smoke test — all green.
+3. **Timing compliance**: full-budget moves still land at ~4.72–4.75 s,
+   inside the 5 s rule.
+
+> **Lesson for the report.** The diagonal bug appeared *three* times in
+> different disguises (`conn`, `_edge_idx`, and the inlined evaluator), each
+> time because a branch tested `dr` alone instead of `dr` **and** `dc`. In
+> this game variant the anti-diagonal must never be treated as a vertical
+> edge. A single property test comparing against a reference implementation
+> caught all three — much cheaper than debugging losses during play.

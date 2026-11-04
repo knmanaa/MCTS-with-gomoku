@@ -146,6 +146,48 @@ def best_move(state, color):
     edgeH_l = np.asarray(state[1]).astype(bool).tolist()
     edgeV_l = np.asarray(state[2]).astype(bool).tolist()
 
+    # flat edge lists (for inlined lookups in the hot loops):
+    #   ehF[r*(n_cols-1)+c] = edge (r,c)-(r,c+1)
+    #   evF[r*n_cols+c]     = edge (r,c)-(r+1,c)
+    ncm1 = n_cols - 1
+    EH_SIZE = n_rows * ncm1
+    ehF = np.asarray(state[1]).astype(bool).ravel().tolist()
+    evF = np.asarray(state[2]).astype(bool).ravel().tolist()
+    edges = ehF + evF                   # gate table indices point into this
+
+    def _edge_idx(r, c, dr, dc):
+        """Index into `edges` for the edge (r,c)->(r+dr,c+dc); -1 = diagonal."""
+        if dr == 0 and dc == 1:
+            return r * ncm1 + c
+        if dr == 0 and dc == -1:
+            return r * ncm1 + c - 1
+        if dr == 1 and dc == 0:
+            return EH_SIZE + r * n_cols + c
+        if dr == -1 and dc == 0:
+            return EH_SIZE + (r - 1) * n_cols + c
+        return -1                       # |dr| == |dc| == 1: diagonal, always linked
+
+    # per-cell gate table for the win check: for each of the four directions,
+    # (dr, dc, fwd neighbour, fwd edge, bwd neighbour, bwd edge); -1 marks
+    # out-of-bounds neighbours / diagonal directions (no edge needed)
+    gates4 = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            entries = []
+            for dr, dc in DIRS4:
+                fr, fc = r + dr, c + dc
+                if 0 <= fr < n_rows and 0 <= fc < n_cols:
+                    fnb, fe = fr * n_cols + fc, _edge_idx(r, c, dr, dc)
+                else:
+                    fnb, fe = -1, -1
+                br, bc = r - dr, c - dc
+                if 0 <= br < n_rows and 0 <= bc < n_cols:
+                    bnb, be = br * n_cols + bc, _edge_idx(br, bc, dr, dc)
+                else:
+                    bnb, be = -1, -1
+                entries.append((dr, dc, fnb, fe, bnb, be))
+            gates4.append(tuple(entries))
+
     # 8-neighbour flat indices (diagonals included: always connected)
     neighbors8 = []
     for r in range(n_rows):
@@ -187,13 +229,24 @@ def best_move(state, color):
             cc -= dc
         return L
 
+    def win_check(bd, a):
+        """Exact win check for the stone at flat index `a`, with a cheap
+        neighbour gate: a direction can only hold a line of >= 2 stones if
+        the immediate neighbour through a live connection is ours, so the
+        full two-way walk runs only for directions that pass the gate."""
+        color = bd[a]
+        r, c = divmod(a, n_cols)
+        for dr, dc, fnb, fe, bnb, be in gates4[a]:
+            fwd = fnb >= 0 and bd[fnb] == color and (fe < 0 or edges[fe])
+            bwd = bnb >= 0 and bd[bnb] == color and (be < 0 or edges[be])
+            if (fwd or bwd) and line_len(bd, r, c, dr, dc) == 5:
+                return True
+        return False
+
     def is_winning_move(bd, r, c):
         """Whether the stone just placed at (r, c) completes an unbroken
         line of exactly five stones (the game would be over)."""
-        for dr, dc in DIRS4:
-            if line_len(bd, r, c, dr, dc) == 5:
-                return True
-        return False
+        return win_check(bd, r * n_cols + c)
 
     def run_extent(bd, r, c, dr, dc):
         """For the maximal unbroken line of bd[r, c] through (r, c) along
@@ -247,7 +300,7 @@ def best_move(state, color):
         child and are kept from the perspective of the player who made the
         move leading to it (the parent's player to move)."""
         __slots__ = ('board', 'player', 'children', 'untried', 'prior',
-                     'N', 'W', 'Q', 'terminal_value')
+                     'N', 'W', 'Q', 'terminal_value', 'empties')
 
         def __init__(self, board, player):
             self.board = board          # flat list, player to move = `player`
@@ -259,6 +312,7 @@ def best_move(state, color):
             self.W = 0.0                # total action value
             self.Q = 0.0                # mean action value W / N
             self.terminal_value = None  # value for the player to move if over
+            self.empties = None         # flat indices of this board's empties
 
     def create_child(node, a):
         """Apply action `a` for node's player to move; return the child."""
@@ -266,9 +320,10 @@ def best_move(state, color):
         bd = node.board[:]              # copy; the parent's board is reused
         bd[a] = node.player
         child = Node(bd, -node.player)
-        if is_winning_move(bd, r, c):
+        child.empties = [i for i in node.empties if i != a]
+        if win_check(bd, a):
             child.terminal_value = -1.0                          # mover won
-        elif 0 not in bd:
+        elif not child.empties:
             child.terminal_value = 1.0 if child.player == WHITE else -1.0
         return child
 
@@ -292,7 +347,7 @@ def best_move(state, color):
     def expand(node, actions, rich):
         """Create the action set of `node` with heuristic priors P(s, a)."""
         if actions is None:
-            actions = [i for i in range(n_cells) if node.board[i] == 0]
+            actions = node.empties   # set at creation; no rescan needed
         if rich:
             scores = rich_scores(node.board, node.player, actions)
         else:
@@ -314,8 +369,9 @@ def best_move(state, color):
                 best_s, best_a = s, a
         return best_a
 
-    # batched random numbers (much cheaper than one call per ply)
-    RBN = ROLLOUT_DEPTH + 8
+    # batched random numbers (much cheaper than one call per ply); the large
+    # batch means a refill is needed only once per ~100 rollouts
+    RBN = max(4096, ROLLOUT_DEPTH + 8)
     rs = np.random.random(RBN).tolist()
     rs_i = [0]
 
@@ -331,7 +387,10 @@ def best_move(state, color):
         """Static evaluation in [-1, 1] from `for_player`'s perspective:
         openness-weighted squared lengths of all maximal connected lines,
         (L-1)^2 * (1 + KAPPA * playable_ends).  An open 3 thus outweighs a
-        closed 4, which is the fix for the open-three blindness."""
+        closed 4, which is the fix for the open-three blindness.
+
+        The per-direction edge lookups are inlined (ehF/evF) instead of
+        going through conn(): this loop runs once per simulation."""
         sb = sw = 0.0
         for i in range(n_cells):
             v = bd[i]
@@ -339,37 +398,69 @@ def best_move(state, color):
                 continue
             r, c = divmod(i, n_cols)
             for dr, dc in DIRS4:
-                br, bc = r - dr, c - dc
-                if (0 <= br < n_rows and 0 <= bc < n_cols
-                        and bd[br * n_cols + bc] == v and conn(br, bc, dr, dc)):
-                    continue          # not the start of a line
+                br = r - dr
+                bc = c - dc
+                if (0 <= br < n_rows and 0 <= bc < n_cols) \
+                        and bd[br * n_cols + bc] == v:
+                    # behind cell is the same colour: this is the start of a
+                    # line only if the connecting edge is missing
+                    if dr == 0:
+                        if ehF[br * ncm1 + (bc if dc == 1 else bc - 1)]:
+                            continue
+                    elif dc == 0:
+                        if evF[(br if dr == 1 else br - 1) * n_cols + bc]:
+                            continue
+                    else:
+                        continue    # diagonal behind: always connected
                 L = 1
                 rr, cc = r, c
-                while (0 <= rr + dr < n_rows and 0 <= cc + dc < n_cols
-                       and bd[(rr + dr) * n_cols + cc + dc] == v
-                       and conn(rr, cc, dr, dc)):
-                    L += 1
-                    rr += dr
-                    cc += dc
-                if L >= 2:
-                    # playable ends: an empty cell just beyond each extreme
-                    # of the run, reachable through an existing edge
-                    ends = 0
-                    er, ec = r - dr, c - dc
-                    if (0 <= er < n_rows and 0 <= ec < n_cols
-                            and bd[er * n_cols + ec] == 0
-                            and conn(er, ec, dr, dc)):
-                        ends += 1
-                    er, ec = rr + dr, cc + dc
-                    if (0 <= er < n_rows and 0 <= ec < n_cols
-                            and bd[er * n_cols + ec] == 0
-                            and conn(rr, cc, dr, dc)):
-                        ends += 1
-                    w = (L - 1) ** 2 * (1.0 + KAPPA * ends)
-                    if v == 1:
-                        sb += w
+                while True:
+                    fr = rr + dr
+                    fc = cc + dc
+                    if not (0 <= fr < n_rows and 0 <= fc < n_cols) \
+                            or bd[fr * n_cols + fc] != v:
+                        break
+                    # edge between (rr,cc) and (fr,fc) -- belongs to (rr,cc)
+                    if dr == 0:
+                        linked = ehF[rr * ncm1 + (cc if dc == 1 else cc - 1)]
+                    elif dc == 0:
+                        linked = evF[(rr if dr == 1 else rr - 1) * n_cols + cc]
                     else:
-                        sw += w
+                        linked = True
+                    if not linked:
+                        break
+                    L += 1
+                    rr, cc = fr, fc
+                if L < 2:
+                    continue
+                # playable ends: an empty cell just beyond each extreme
+                # of the run, reachable through an existing edge
+                ends = 0
+                er = r - dr
+                ec = c - dc
+                if 0 <= er < n_rows and 0 <= ec < n_cols \
+                        and bd[er * n_cols + ec] == 0:
+                    if dr == 0:
+                        ends += ehF[er * ncm1 + (ec if dc == 1 else ec - 1)]
+                    elif dc == 0:
+                        ends += evF[(er if dr == 1 else er - 1) * n_cols + ec]
+                    else:
+                        ends += 1
+                er = rr + dr
+                ec = cc + dc
+                if 0 <= er < n_rows and 0 <= ec < n_cols \
+                        and bd[er * n_cols + ec] == 0:
+                    if dr == 0:
+                        ends += ehF[rr * ncm1 + (cc if dc == 1 else cc - 1)]
+                    elif dc == 0:
+                        ends += evF[(rr if dr == 1 else rr - 1) * n_cols + cc]
+                    else:
+                        ends += 1
+                w = (L - 1) ** 2 * (1.0 + KAPPA * ends)
+                if v == 1:
+                    sb += w
+                else:
+                    sw += w
         score = sb - sw               # black-positive
         score /= (abs(score) + 8.0)   # squash to (-1, 1)
         return score if for_player == 1 else -score
@@ -378,18 +469,16 @@ def best_move(state, color):
         """Depth-capped random playout; returns the value from the
         perspective of the player to move at `node`."""
         bd = node.board[:]            # scratch copy
-        empties = [i for i in range(n_cells) if bd[i] == 0]
+        empties = list(node.empties)  # copy; swap-pop mutates it
         to_move = node.player
         draw_value = 1.0 if node.player == WHITE else -1.0
         for _ in range(ROLLOUT_DEPTH):
             if not empties:
                 return draw_value     # draw: White wins
             a = empties.pop(int(next_rand() * len(empties)))
-            r, c = divmod(a, n_cols)
             bd[a] = to_move
-            for dr, dc in DIRS4:
-                if line_len(bd, r, c, dr, dc) == 5:
-                    return 1.0 if to_move == node.player else -1.0
+            if win_check(bd, a):
+                return 1.0 if to_move == node.player else -1.0
             to_move = -to_move
         return static_eval(bd, node.player)
 
@@ -442,6 +531,7 @@ def best_move(state, color):
 
     # ---- PUCT-MCTS ----
     root = Node(board_flat[:], color)
+    root.empties = empties0         # full empty set (root_actions may be a subset)
     expand(root, root_actions, rich=True)
 
     while time.perf_counter() < deadline:
