@@ -20,6 +20,19 @@ Every helper is a *nested* definition that reads `n_rows`, `edgeH_l`,
 
 ---
 
+## Glossary of terms used in this document
+
+| Term | Meaning |
+| --- | --- |
+| **ply** | One single stone placed by one player (a half-move). `ROLLOUT_DEPTH = 32` plies = 32 stones total (16 per side) before the static evaluator takes over. Two plies = one move by each side. |
+| **run** | A straight sequence of same-colour stones along one direction $d \in D$ where every consecutive pair is joined by an *existing* edge (H/V) or is a diagonal pair (always connected). |
+| **maximal (run)** | The run cannot be extended in either direction: the cell just beyond each end is not the same colour joined by a live connection (empty, opponent's, board edge, or a missing edge). Guarantees each run is counted exactly once — from its start cell only. |
+| **open 3 / closed 3** | A run of 3 stones whose **both** ends are playable (empty *and* reachable through an existing edge — in our variant a missing edge can close an end) vs. only **one** playable end. An open 3 threatens an *open* 4 next move → two winning cells → the opponent must respond immediately. A closed 3 can only become a *closed* 4 → one winning cell → easily blocked. |
+| **open 4 / closed 4** | A run of 4 with both ends playable (an **open 4** = two win-in-1 cells = already decisive) vs. one playable end (**closed 4** = exactly one win-in-1 cell = must be blocked now; the root hard rules do this). |
+| **win-in-1** | A cell that, if occupied by colour $p$, completes an exactly-five line for $p$: $\mathcal{W}_p$ at the root, detected per ply in rollouts via the four `line_len` checks. |
+
+---
+
 ## The quantities, in mathematics
 
 **State and actions.** A state is the tuple
@@ -84,6 +97,7 @@ t0 = time.perf_counter()
 TIME_LIMIT    = globals().get('MCTS_TIME_LIMIT', 4.7)
 C_PUCT        = globals().get('MCTS_C_PUCT', 1.4)
 ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
+KAPPA         = globals().get('MCTS_KAPPA', 1.5)
 deadline = t0 + TIME_LIMIT
 
 n_rows, n_cols = state[0].shape
@@ -252,6 +266,65 @@ is placed — a win can only be completed by the newest stone — so four line
 scans through one cell are equivalent to `check_result`'s full-board scan,
 but ~50× cheaper. The referee test (MCTS games refereed by
 `check_result`) verifies this equivalence empirically.
+
+Two helpers built on the same machinery serve the open-four threat layer
+(see *Root hard rules*):
+
+```python
+def run_extent(bd, r, c, dr, dc):
+    """For the maximal unbroken line of bd[r, c] through (r, c) along
+    (dr, dc), return (L, start, end): the length and the two extreme
+    cells of the run (start is the cell furthest along -d)."""
+    color = bd[r * n_cols + c]
+    s_r, s_c = r, c
+    br, bc = r - dr, c - dc
+    while (0 <= br < n_rows and 0 <= bc < n_cols
+           and bd[br * n_cols + bc] == color
+           and conn(br, bc, dr, dc)):
+        s_r, s_c = br, bc
+        br -= dr
+        bc -= dc
+    e_r, e_c = r, c
+    fr, fc = r + dr, c + dc
+    while (0 <= fr < n_rows and 0 <= fc < n_cols
+           and bd[fr * n_cols + fc] == color
+           and conn(e_r, e_c, dr, dc)):
+        e_r, e_c = fr, fc
+        fr += dr
+        fc += dc
+    L = (e_r - s_r) * dr + (e_c - s_c) * dc + 1   # dot with the unit step
+    return L, (s_r, s_c), (e_r, e_c)
+
+def four_threat_count(bd, a, pl):
+    """Number of win-in-1 cells colour `pl` would gain by placing a
+    stone at flat index a (only the four lines through a can change).
+    Requires: a is empty and no win-in-1 cells for pl exist on bd yet
+    (both hold at the point of use: mine/theirs were handled first)."""
+    r, c = divmod(a, n_cols)
+    bd[a] = pl
+    total = 0
+    for dr, dc in DIRS4:
+        L, s, e = run_extent(bd, r, c, dr, dc)
+        if L != 4:
+            continue
+        pr, pc = s[0] - dr, s[1] - dc     # extension cell before the run
+        if (0 <= pr < n_rows and 0 <= pc < n_cols
+                and bd[pr * n_cols + pc] == 0 and conn(pr, pc, dr, dc)):
+            total += 1
+        qr, qc = e[0] + dr, e[1] + dc     # extension cell after the run
+        if (0 <= qr < n_rows and 0 <= qc < n_cols
+                and bd[qr * n_cols + qc] == 0 and conn(e[0], e[1], dr, dc)):
+            total += 1
+    bd[a] = 0
+    return total
+```
+
+`run_extent` is `line_len` plus the run's two extreme cells (the length is
+the step direction dotted with the end-to-start displacement, which is
+exact for all four unit directions). `four_threat_count` is the atomic
+operation of the open-four layer: place a hypothetical stone, and count
+how many *playable* extension cells the resulting $L = 4$ runs expose —
+each one is a win-in-1 cell the opponent would then have to answer.
 
 ---
 
@@ -536,14 +609,38 @@ millisecond trade.
 ### Option A: the static evaluator $V(s)$
 
 Let $\Phi_x(s)$ sum, over **all maximal edge-connected runs** of colour $x$
-with length $L \geq 2$:
+with length $L \geq 2$, an **openness-weighted** contribution. For a run,
+let $e \in \{0, 1, 2\}$ be its number of **playable ends**: an empty,
+in-bounds cell immediately beyond each extreme of the run, reachable
+through an existing edge (diagonals always; in our variant a missing edge
+closes an end). Then
 
 $$
-\Phi_x(s) \;=\; \sum_{\text{runs of } x \text{ with length } L \geq 2} (L-1)^2
+g(L, e) \;=\; (L-1)^2 \,\bigl(1 + \kappa\, e\bigr),
+\qquad \kappa \approx 1.5
+\qquad\Longrightarrow\qquad
+\Phi_x(s) \;=\; \sum_{\text{runs of } x} g\bigl(L, e\bigr)
 $$
 
-— quadratic in length, so a four-in-a-line is worth vastly more than a
-two-line. Then
+Two escalation axes, deliberately separated: $(L-1)^2$ is **convex in
+length** (a four-line is worth vastly more than a two-line), and
+$1 + \kappa e$ is **linear in openness** (the same stones are $\kappa$
+times more dangerous when both ends are playable). The resulting hierarchy
+at $\kappa = 1.5$ is exactly the threat taxonomy of the glossary:
+
+| run | $L$ | $e$ | $g$ |
+| --- | --- | --- | --- |
+| closed 2 | 2 | 0 | 1 |
+| open 2 / closed 3 | 2 / 3 | 2 / 0 | 4 |
+| closed 4 | 4 | 0 | 9 |
+| **open 3** | 3 | 2 | **16** |
+| **open 4** | 4 | 2 | **36** |
+
+An **open 3** (16) outranks a **closed 4** (9) — correct, since a closed 4
+is one blockable win-in-1 cell while an open 3 is a forced-loss trajectory
+— but an **open 4** (36) towers over everything, as a forced win should.
+(Exact win-in-1 cells are handled by the root hard rules below; the
+evaluator only needs the right *ranking*.) Then
 
 $$
 \tilde V(s) \;=\; \frac{\Phi_{+1}(s) - \Phi_{-1}(s)}
@@ -556,7 +653,9 @@ $$
 ```python
 def static_eval(bd, for_player):
     """Static evaluation in [-1, 1] from `for_player`'s perspective:
-    compares the squared lengths of all maximal connected lines."""
+    openness-weighted squared lengths of all maximal connected lines,
+    (L-1)^2 * (1 + KAPPA * playable_ends).  An open 3 thus outweighs a
+    closed 4, which is the fix for the open-three blindness."""
     sb = sw = 0.0
     for i in range(n_cells):
         v = bd[i]
@@ -577,10 +676,24 @@ def static_eval(bd, for_player):
                 rr += dr
                 cc += dc
             if L >= 2:
+                # playable ends: an empty cell just beyond each extreme
+                # of the run, reachable through an existing edge
+                ends = 0
+                er, ec = r - dr, c - dc
+                if (0 <= er < n_rows and 0 <= ec < n_cols
+                        and bd[er * n_cols + ec] == 0
+                        and conn(er, ec, dr, dc)):
+                    ends += 1
+                er, ec = rr + dr, cc + dc
+                if (0 <= er < n_rows and 0 <= ec < n_cols
+                        and bd[er * n_cols + ec] == 0
+                        and conn(rr, cc, dr, dc)):
+                    ends += 1
+                w = (L - 1) ** 2 * (1.0 + KAPPA * ends)
                 if v == 1:
-                    sb += (L - 1) ** 2
+                    sb += w
                 else:
-                    sw += (L - 1) ** 2
+                    sw += w
     score = sb - sw               # black-positive
     score /= (abs(score) + 8.0)   # squash to (-1, 1)
     return score if for_player == 1 else -score
@@ -589,7 +702,99 @@ def static_eval(bd, for_player):
 The "skip" condition (the cell behind is the same colour **and connected**)
 ensures each run is counted exactly once from its start; the
 bounds-before-edge-lookup ordering in the `while` condition means `conn`
-only ever touches an in-bounds cell's edge.
+only ever touches an in-bounds cell's edge. Note the asymmetry in the two
+end checks: the edge *before* the run's start belongs to
+$(r-dr, c-dc)$ — indexed by the extension cell — while the edge *after*
+the run's last cell $(rr, cc)$ belongs to $(rr, cc)$ — indexed by the run.
+
+**How the runs relate to $V(s)$.** The runs are the raw data; $V(s)$ is the
+final scalar built from them, in four steps:
+
+$$
+\underbrace{\text{maximal edge-connected runs of } x}_{\text{the census: counted once each, } L \geq 2}
+\;\longrightarrow\;
+\Phi_x(s) = \sum_{\text{runs of } x} g(L, e)
+\;\longrightarrow\;
+\tilde V(s) = \frac{\Phi_{+1}(s) - \Phi_{-1}(s)}{|\Phi_{+1}(s) - \Phi_{-1}(s)| + 8}
+\;\longrightarrow\;
+V(s) = \begin{cases}\tilde V(s) & \text{Black to move}\\ -\tilde V(s) & \text{White to move}\end{cases}
+$$
+
+Worked example — the only lines on the board are a black **open** 3
+($L = 3$, $e = 2$), a black closed 2 ($L = 2$, $e = 0$), and a white closed
+2:
+
+$$
+\Phi_{+1} = (3-1)^2 (1 + 1.5 \cdot 2) + (2-1)^2 \cdot 1 = 16 + 1 = 17, \qquad
+\Phi_{-1} = (2-1)^2 \cdot 1 = 1, \qquad
+\tilde V = \frac{16}{16+8} \approx +0.67
+$$
+
+Under the old length-only evaluator the same position gave
+$\tilde V = 4/13 \approx +0.31$: the open 3 was nearly invisible. Now it
+dominates the score — which is precisely what makes "ignore the open three"
+branches evaluate badly at every rollout cutoff. In the code, `sb`/`sw` are
+literally $\Phi_{+1}$/$\Phi_{-1}$, and the last three lines of
+`static_eval` are the squash and perspective steps. This matters because
+$V(s_{\text{cut}})$ is the value of every rollout that hits the 32-ply cap
+— i.e. the leaf evaluation almost everywhere the game does not end inside
+the playout.
+
+### Design rationale for $V(s)$
+
+**Why run length $L$ as the core feature?**
+
+- $L$ is *distance-to-winning in disguise*: the game is won at $L = 5$; a
+  run of 4 means win-in-1, a 3 means "threatens a 4". $L$ therefore orders
+  every line by urgency *by construction* — no pattern book needed.
+- It is the **cheapest sufficient statistic**: computing $L$ needs only
+  short local walks (~4–8 cells each). The evaluator runs thousands of
+  times per move (once per depth-capped rollout), so it must stay around
+  0.1 ms on a 221-cell board — and the import rules forbid anything
+  heavier than NumPy anyway.
+- It is the correct **first-order approximation** of classical gomoku
+  theory, where the patterns that matter (live/dead twos, threes, fours)
+  are runs and their openness. Openness is the second coordinate, added by
+  the $g(L, e)$ factor below.
+
+**Why the openness factor $1 + \kappa e$?** Openness is a *multiplier* on
+threat, not a bonus: the same three stones are $\kappa$ times more
+dangerous with both ends playable than with one blocked, because the
+dangerous *trajectory* (open 3 → open 4 → win) exists only in the open
+case. The form $1 + \kappa e$ has exactly one tuning parameter
+($\kappa$ interpolating between the old length-only evaluator at
+$\kappa = 0$ and strong threat sensitivity), keeps $g = 1$ for fully dead
+runs (today's behaviour as the baseline), and the resulting ranking —
+open 3 (16) > closed 4 (9) — matches the glossary's threat taxonomy. A
+full $6 \times 3$ lookup table would be more expressive but adds ~18
+hand-tuned entries for second-order gains; the search's $Q$ values should
+resolve those, not the evaluator. What $g$ deliberately does *not* capture
+— gap patterns like `● ● . ● ●` — is handled by the tree (which tries the
+gap cell) and the root win-in-1 rules; the evaluator only needs to be a
+good *average* signal at rollout cutoffs.
+
+**Why the $(L-1)^2$ weighting?** It makes urgency **convex** — each extra
+stone is worth disproportionately more:
+
+| $L$ | $(L-1)^2$ | meaning |
+| --- | --- | --- |
+| 2 | 1 | mild potential |
+| 3 | 4 | a real threat forming |
+| 4 | 9 | win-in-1 — must be answered now |
+
+A single 4-run (9) outweighs *nine* separate 2-runs (9 × 1) — the right
+trade, since a near-win dominates any amount of vague potential. A linear
+$L$ would allow exactly that absurd trade. The $-1$ keeps lone stones at 0;
+the $+8$ in $\tilde V$'s denominator is the matching soft cap — no
+*material* lead in gomoku is a certain win until a five actually exists,
+so $V$ never quite reaches $\pm 1$.
+
+**Why maximal + edge-connected as the counting unit?** *Maximal* → each
+line counted exactly once (no double counting from a run's middle cells).
+*Edge-connected* → correctness in this variant: a missing edge genuinely
+breaks a line (Figure 5), so the evaluator agrees with `check_result`'s
+win rule — an evaluator that believed in phantom lines would misjudge
+entire positions.
 
 ---
 
@@ -704,8 +909,29 @@ mine = winning_cells(color)
 if mine:
     return divmod(mine[0], n_cols)      # win immediately
 theirs = winning_cells(-color)
-# if the opponent can win next move, every other move loses: block
-root_actions = theirs if theirs else empties0
+if theirs:
+    # if the opponent can win next move, every other move loses: block
+    root_actions = theirs
+else:
+    # ---- open-four threat layer (one ply earlier than win-in-1) ----
+    # M: cells where OUR stone creates >= 2 win-in-1 cells -- an open
+    #    four.  This is a forced win: the opponent cannot outrace two
+    #    win-in-1 cells with a single reply.
+    # O: cells where THEIR stone creates >= 2 win-in-1 cells -- if they
+    #    get to play one, we lose by force.
+    # F: cells where OUR stone creates >= 1 win-in-1 cell -- a forcing
+    #    four ("fight threes with fours"): they must answer or lose.
+    # Any move outside M | F | O loses by force when O != empty, so the
+    # search is restricted to M | F | O; M itself wins outright.
+    M = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 2]
+    if M:
+        return divmod(M[0], n_cols)
+    O = [a for a in empties0 if four_threat_count(board_flat, a, -color) >= 2]
+    if O:
+        F = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 1]
+        root_actions = sorted(set(F) | set(O))
+    else:
+        root_actions = empties0
 if len(root_actions) == 1:
     return divmod(root_actions[0], n_cols)
 
@@ -725,8 +951,57 @@ expand(root, root_actions, rich=True)
   $\mathcal{A}(s_0) \leftarrow \mathcal{W}_{-p}$**.
 - A single candidate → return without searching.
 
-The root then expands with the **rich** priors over the (possibly
-restricted) action set, and the search runs:
+### The open-four threat layer ($M$, $F$, $O$)
+
+Define the **four-threat count** of an empty cell $a$ for colour $p$:
+
+$$
+T_p(a) \;=\; \bigl|\{\, \text{win-in-1 cells for } p \text{ after placing a stone of } p \text{ at } a \,\}\bigr|
+$$
+
+Only the four lines through $a$ can change, so `four_threat_count` places
+the stone, walks each direction with `run_extent` (length + both extreme
+cells of the resulting run), and counts the **playable extension cells**
+of every resulting $L = 4$ run. Then:
+
+$$
+M = \{a : T_p(a) \geq 2\}, \qquad
+O = \{a : T_{-p}(a) \geq 2\}, \qquad
+F = \{a : T_p(a) \geq 1\}
+$$
+
+with $p$ our colour. The game theory that justifies the cascade:
+
+- **$M \neq \emptyset$ is a forced win** for us: after our move we hold two
+  win-in-1 cells; the opponent's single reply can block at most one (and
+  they have no win-in-1 of their own to race with, since
+  $\mathcal{W}_{-p} = \emptyset$ was handled first). We play our remaining
+  win cell and win. Hence $M$ is returned immediately, like `mine`.
+- **If $O \neq \emptyset$ and $M = \emptyset$, every move outside
+  $M \cup F \cup O$ loses by force**: the opponent answers with some
+  $a \in O \setminus \{m\}$ (an open four — two win cells), we hold no
+  win-in-1 ($m \notin F$), so we block one cell and they win at the other.
+  Restricting the search to $M \cup F \cup O$ is therefore *sound*.
+- **Why not just "block"?** Two reasons. First, a naive block-restriction
+  would be *unsound*: our own open-four move ($M$) beats their open 3 by
+  outracing it, and our four-making moves ($F$) are legal *tempo*
+  defences — "fight threes with fours": the opponent must answer our
+  win-in-1 or lose, which delays their open four by a ply. Second, the
+  choice between blocking ($O$) and counter-attacking ($F$) is a genuine
+  value decision — exactly what the search with the openness-aware $V(s)$
+  is good at.
+- **Variant-awareness**: a "playable" extension cell requires the
+  connecting *edge* to exist, so in our variant even the *ends* of a run
+  can be closed by a missing edge — $T_p(a)$ counts only real threats.
+- **Cost**: three scans over the empty cells, each ~4 short line walks per
+  cell → a few milliseconds, once per move. Positions without open-four
+  threats pay nothing beyond the $O$-scan.
+
+If $|F \cup O| = 1$ → return it directly (no search); otherwise the root
+expands with the **rich** priors over the restricted set and the search
+concentrates all ~20k simulations on the cells that matter.
+
+The search runs:
 
 ```python
 while time.perf_counter() < deadline:
@@ -768,6 +1043,7 @@ move).
 | `MCTS_TIME_LIMIT` | 4.7 s | Search budget per move (must stay ≤ 5 s) |
 | `MCTS_C_PUCT` | 1.4 | Exploration constant $c_{\text{puct}}$ |
 | `MCTS_ROLLOUT_DEPTH` | 32 | Plies before the static evaluator takes over |
+| `MCTS_KAPPA` | 1.5 | Openness weight $\kappa$ in $g(L, e) = (L-1)^2 (1 + \kappa e)$ |
 
 They can be overridden from outside **without editing the code** (e.g.
 `project_skeleton.MCTS_TIME_LIMIT = 0.15` for fast benchmark games); the

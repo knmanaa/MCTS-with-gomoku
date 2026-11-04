@@ -127,12 +127,13 @@ def best_move(state, color):
     #
     # Tunables can be overridden from outside for benchmarking WITHOUT
     # editing this file (they default to the values below):
-    #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH
+    #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA
 
     t0 = time.perf_counter()
     TIME_LIMIT    = globals().get('MCTS_TIME_LIMIT', 4.7)
     C_PUCT        = globals().get('MCTS_C_PUCT', 1.4)
     ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
+    KAPPA         = globals().get('MCTS_KAPPA', 1.5)
     deadline = t0 + TIME_LIMIT
 
     n_rows, n_cols = state[0].shape
@@ -193,6 +194,53 @@ def best_move(state, color):
             if line_len(bd, r, c, dr, dc) == 5:
                 return True
         return False
+
+    def run_extent(bd, r, c, dr, dc):
+        """For the maximal unbroken line of bd[r, c] through (r, c) along
+        (dr, dc), return (L, start, end): the length and the two extreme
+        cells of the run (start is the cell furthest along -d)."""
+        color = bd[r * n_cols + c]
+        s_r, s_c = r, c
+        br, bc = r - dr, c - dc
+        while (0 <= br < n_rows and 0 <= bc < n_cols
+               and bd[br * n_cols + bc] == color
+               and conn(br, bc, dr, dc)):
+            s_r, s_c = br, bc
+            br -= dr
+            bc -= dc
+        e_r, e_c = r, c
+        fr, fc = r + dr, c + dc
+        while (0 <= fr < n_rows and 0 <= fc < n_cols
+               and bd[fr * n_cols + fc] == color
+               and conn(e_r, e_c, dr, dc)):
+            e_r, e_c = fr, fc
+            fr += dr
+            fc += dc
+        L = (e_r - s_r) * dr + (e_c - s_c) * dc + 1   # dot with the unit step
+        return L, (s_r, s_c), (e_r, e_c)
+
+    def four_threat_count(bd, a, pl):
+        """Number of win-in-1 cells colour `pl` would gain by placing a
+        stone at flat index a (only the four lines through a can change).
+        Requires: a is empty and no win-in-1 cells for pl exist on bd yet
+        (both hold at the point of use: mine/theirs were handled first)."""
+        r, c = divmod(a, n_cols)
+        bd[a] = pl
+        total = 0
+        for dr, dc in DIRS4:
+            L, s, e = run_extent(bd, r, c, dr, dc)
+            if L != 4:
+                continue
+            pr, pc = s[0] - dr, s[1] - dc     # extension cell before the run
+            if (0 <= pr < n_rows and 0 <= pc < n_cols
+                    and bd[pr * n_cols + pc] == 0 and conn(pr, pc, dr, dc)):
+                total += 1
+            qr, qc = e[0] + dr, e[1] + dc     # extension cell after the run
+            if (0 <= qr < n_rows and 0 <= qc < n_cols
+                    and bd[qr * n_cols + qc] == 0 and conn(e[0], e[1], dr, dc)):
+                total += 1
+        bd[a] = 0
+        return total
 
     class Node:
         """Search-tree node.  Edge statistics (N, W, Q) are stored on the
@@ -281,7 +329,9 @@ def best_move(state, color):
 
     def static_eval(bd, for_player):
         """Static evaluation in [-1, 1] from `for_player`'s perspective:
-        compares the squared lengths of all maximal connected lines."""
+        openness-weighted squared lengths of all maximal connected lines,
+        (L-1)^2 * (1 + KAPPA * playable_ends).  An open 3 thus outweighs a
+        closed 4, which is the fix for the open-three blindness."""
         sb = sw = 0.0
         for i in range(n_cells):
             v = bd[i]
@@ -302,10 +352,24 @@ def best_move(state, color):
                     rr += dr
                     cc += dc
                 if L >= 2:
+                    # playable ends: an empty cell just beyond each extreme
+                    # of the run, reachable through an existing edge
+                    ends = 0
+                    er, ec = r - dr, c - dc
+                    if (0 <= er < n_rows and 0 <= ec < n_cols
+                            and bd[er * n_cols + ec] == 0
+                            and conn(er, ec, dr, dc)):
+                        ends += 1
+                    er, ec = rr + dr, cc + dc
+                    if (0 <= er < n_rows and 0 <= ec < n_cols
+                            and bd[er * n_cols + ec] == 0
+                            and conn(rr, cc, dr, dc)):
+                        ends += 1
+                    w = (L - 1) ** 2 * (1.0 + KAPPA * ends)
                     if v == 1:
-                        sb += (L - 1) ** 2
+                        sb += w
                     else:
-                        sw += (L - 1) ** 2
+                        sw += w
         score = sb - sw               # black-positive
         score /= (abs(score) + 8.0)   # squash to (-1, 1)
         return score if for_player == 1 else -score
@@ -350,8 +414,29 @@ def best_move(state, color):
     if mine:
         return divmod(mine[0], n_cols)      # win immediately
     theirs = winning_cells(-color)
-    # if the opponent can win next move, every other move loses: block
-    root_actions = theirs if theirs else empties0
+    if theirs:
+        # if the opponent can win next move, every other move loses: block
+        root_actions = theirs
+    else:
+        # ---- open-four threat layer (one ply earlier than win-in-1) ----
+        # M: cells where OUR stone creates >= 2 win-in-1 cells -- an open
+        #    four.  This is a forced win: the opponent cannot outrace two
+        #    win-in-1 cells with a single reply.
+        # O: cells where THEIR stone creates >= 2 win-in-1 cells -- if they
+        #    get to play one, we lose by force.
+        # F: cells where OUR stone creates >= 1 win-in-1 cell -- a forcing
+        #    four ("fight threes with fours"): they must answer or lose.
+        # Any move outside M | F | O loses by force when O != empty, so the
+        # search is restricted to M | F | O; M itself wins outright.
+        M = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 2]
+        if M:
+            return divmod(M[0], n_cols)
+        O = [a for a in empties0 if four_threat_count(board_flat, a, -color) >= 2]
+        if O:
+            F = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 1]
+            root_actions = sorted(set(F) | set(O))
+        else:
+            root_actions = empties0
     if len(root_actions) == 1:
         return divmod(root_actions[0], n_cols)
 
