@@ -59,8 +59,8 @@ $z \in \{-1, +1\}$ instead of children:
 
 $$
 z(s) \;=\; \begin{cases}
--1, & \text{the move just played won the game (the player to move lost)}\\[2pt]
-+1, & \text{draw and the player to move is White (a draw counts as a win for White)}\\[2pt]
+-1, & \text{the move just played won the game (the player to move lost)} \\
++1, & \text{draw and the player to move is White (a draw counts as a win for White)} \\
 -1, & \text{draw and the player to move is Black}
 \end{cases}
 $$
@@ -152,11 +152,11 @@ canonical step pairs from the table above — so it selects *which line
 orientation* through $a$ is measured, while $a$ selects *which cell*. Since
 lines are symmetric, the 4 canonical directions combined with the
 **both-ways** scan inside `line_len` cover all eight orientations. Example:
-$L_{+1}\bigl((8,4), (0,1)\bigr)$ is "how long is the horizontal black line
+$L_{+1}\left((8,4), (0,1)\right)$ is "how long is the horizontal black line
 through $(8,4)$?" — the subscript is the colour, the second argument the
 orientation. This is exactly how the two prior weight tables use it:
-$w_{\text{ext}}\bigl(L_p(a,d)\bigr)$ scores extending **our** line through
-$a$, and $w_{\text{blk}}\bigl(L_{-p}(a,d)\bigr)$ scores occupying a cell
+$w_{\text{ext}}\left(L_p(a,d)\right)$ scores extending **our** line through
+$a$, and $w_{\text{blk}}\left(L_{-p}(a,d)\right)$ scores occupying a cell
 **the opponent's** line through $a$ wants.
 
 ### Coordinate convention and the four directions
@@ -381,13 +381,13 @@ The prior is a normalised heuristic score over the legal actions. For the
 player $p$ to move at state $s$ and the empty cell $a$:
 
 $$
-\underbrace{\text{occ}(a) = \bigl|\{\, j \in \mathcal{N}_8(a) : \text{board}(j) \neq 0 \,\}\bigr|}_{\text{stone proximity}}
+\underbrace{\text{occ}(a) = \left|\{\, j \in \mathcal{N}_8(a) : \text{board}(j) \neq 0 \,\}\right|}_{\text{stone proximity}}
 $$
 
 $$
 \text{score}(a) \;=\; 0.6 \cdot \text{occ}(a)
-\;+\; \sum_{d \in D} w_{\text{ext}}\bigl(L_p(a, d)\bigr)
-\;+\; \sum_{d \in D} w_{\text{blk}}\bigl(L_{-p}(a, d)\bigr)
+\;+\; \sum_{d \in D} w_{\text{ext}}\left(L_p(a, d)\right)
+\;+\; \sum_{d \in D} w_{\text{blk}}\left(L_{-p}(a, d)\right)
 $$
 
 where $L_p(a,d)$ is measured with $a$ *hypothetically occupied* by colour
@@ -403,7 +403,7 @@ $$
 The prior is then the normalised score:
 
 $$
-P(s,a) \;=\; \frac{\text{score}(a) + \varepsilon}{\sum_{a' \in \mathcal{A}(s)} \bigl(\text{score}(a') + \varepsilon\bigr)},
+P(s,a) \;=\; \frac{\text{score}(a) + \varepsilon}{\sum_{a' \in \mathcal{A}(s)} \left(\text{score}(a') + \varepsilon\right)},
 \qquad \varepsilon = 10^{-9}.
 $$
 
@@ -466,7 +466,7 @@ Two moments:
 At every fully-expanded node $s$ the simulation descends by
 
 $$
-a^* \;=\; \arg\max_{a \in \mathcal{A}(s)} \Bigl( Q(s,a) + U(s,a) \Bigr),
+a^* \;=\; \arg\max_{a \in \mathcal{A}(s)} \left( Q(s,a) + U(s,a) \right),
 \qquad
 U(s,a) \;=\; c_{\text{puct}} \cdot P(s,a) \cdot \frac{\sqrt{\sum_b N(s,b)}}{1 + N(s,a)}
 $$
@@ -557,7 +557,8 @@ $$
 v \;=\; \begin{cases}
 +1, & \text{the playout's winner is the leaf's player to move}\\
 -1, & \text{the playout's winner is the opponent}\\
-z_{\text{draw}} = \begin{cases}+1 & \text{leaf's player to move is White}\\ -1 & \text{Black}\end{cases} & \text{board full}\\
++1, & \text{board full and the leaf's player to move is White}\\
+-1, & \text{board full and the leaf's player to move is Black}\\
 V(s_{\text{cut}}), & \text{after } 32 \text{ plies without a terminal}
 \end{cases}
 $$
@@ -623,10 +624,10 @@ through an existing edge (diagonals always; in our variant a missing edge
 closes an end). Then
 
 $$
-g(L, e) \;=\; (L-1)^2 \,\bigl(1 + \kappa\, e\bigr),
+g(L, e) \;=\; (L-1)^2 \,\left(1 + \kappa\, e\right),
 \qquad \kappa \approx 1.5
 \qquad\Longrightarrow\qquad
-\Phi_x(s) \;=\; \sum_{\text{runs of } x} g\bigl(L, e\bigr)
+\Phi_x(s) \;=\; \sum_{\text{runs of } x} g\left(L, e\right)
 $$
 
 Two escalation axes, deliberately separated: $(L-1)^2$ is **convex in
@@ -655,7 +656,7 @@ win should. Then
 
 $$
 \tilde V(s) \;=\; \frac{\Phi_{+1}(s) - \Phi_{-1}(s)}
-                        {\bigl|\Phi_{+1}(s) - \Phi_{-1}(s)\bigr| + 8}
+                        {\left|\Phi_{+1}(s) - \Phi_{-1}(s)\right| + 8}
 \;\in\; (-1, 1)
 \qquad\quad
 V(s) \;=\; \begin{cases}\tilde V(s) & \text{Black to move}\\ -\tilde V(s) & \text{White to move}\end{cases}
@@ -904,7 +905,7 @@ $\mathcal{W}_p$ be the set of empty cells that complete an exactly-five
 line for colour $p$:
 
 $$
-\mathcal{W}_p \;=\; \bigl\{\, a \in \mathcal{A}(s_0) \;:\; \exists\, d \in D,\; L_p(a, d) = 5 \text{ with } a \text{ occupied by } p \,\bigr\}
+\mathcal{W}_p \;=\; \left\{\, a \in \mathcal{A}(s_0) \;:\; \exists\, d \in D,\; L_p(a, d) = 5 \text{ with } a \text{ occupied by } p \,\right\}
 $$
 
 ```python
@@ -987,7 +988,7 @@ expand(root, root_actions, rich=True)
 Define the **four-threat count** of an empty cell $a$ for colour $p$:
 
 $$
-T_p(a) \;=\; \bigl|\{\, \text{win-in-1 cells for } p \text{ after placing a stone of } p \text{ at } a \,\}\bigr|
+T_p(a) \;=\; \left|\{\, \text{win-in-1 cells for } p \text{ after placing a stone of } p \text{ at } a \,\}\right|
 $$
 
 Only the four lines through $a$ can change, so `four_threat_count` places
