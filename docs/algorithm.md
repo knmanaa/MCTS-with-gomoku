@@ -275,56 +275,55 @@ def run_extent(bd, r, c, dr, dc):
     """For the maximal unbroken line of bd[r, c] through (r, c) along
     (dr, dc), return (L, start, end): the length and the two extreme
     cells of the run (start is the cell furthest along -d)."""
-    color = bd[r * n_cols + c]
-    s_r, s_c = r, c
-    br, bc = r - dr, c - dc
-    while (0 <= br < n_rows and 0 <= bc < n_cols
-           and bd[br * n_cols + bc] == color
-           and conn(br, bc, dr, dc)):
-        s_r, s_c = br, bc
-        br -= dr
-        bc -= dc
-    e_r, e_c = r, c
-    fr, fc = r + dr, c + dc
-    while (0 <= fr < n_rows and 0 <= fc < n_cols
-           and bd[fr * n_cols + fc] == color
-           and conn(e_r, e_c, dr, dc)):
-        e_r, e_c = fr, fc
-        fr += dr
-        fc += dc
-    L = (e_r - s_r) * dr + (e_c - s_c) * dc + 1   # dot with the unit step
+    ...
+    # Chebyshev distance: horizontal/vertical runs advance one unit per step,
+    # but a diagonal run advances one unit in BOTH coordinates per step.  The
+    # former dot product (e-s).(dr,dc) therefore double-counted diagonals
+    # (L = 3 reported as 5), so no diagonal four ever reached the threat
+    # layer's "L == 4" branch.  max(|dr|,|dc|) is the true step count in all
+    # four directions.
+    L = max(abs(e_r - s_r), abs(e_c - s_c)) + 1
     return L, (s_r, s_c), (e_r, e_c)
 
 def four_threat_count(bd, a, pl):
-    """Number of win-in-1 cells colour `pl` would gain by placing a
-    stone at flat index a (only the four lines through a can change).
-    Requires: a is empty and no win-in-1 cells for pl exist on bd yet
-    (both hold at the point of use: mine/theirs were handled first)."""
+    """Exact number of distinct empty cells that become immediate winning
+    moves for `pl` after `pl` plays at flat index a.  Every candidate within
+    four steps of `a` along the four lines through `a` is validated by
+    placing a stone and calling win_check.  This rejects a "win" that would
+    make a run of six (an overline, which the rules do not count) and catches
+    a broken four such as X . X X X whose gap is the winning cell."""
     r, c = divmod(a, n_cols)
     bd[a] = pl
-    total = 0
+    found = set()
     for dr, dc in DIRS4:
+        cand = [(r + k * dr, c + k * dc)
+                for k in (-4, -3, -2, -1, 1, 2, 3, 4)]
         L, s, e = run_extent(bd, r, c, dr, dc)
-        if L != 4:
-            continue
-        pr, pc = s[0] - dr, s[1] - dc     # extension cell before the run
-        if (0 <= pr < n_rows and 0 <= pc < n_cols
-                and bd[pr * n_cols + pc] == 0 and conn(pr, pc, dr, dc)):
-            total += 1
-        qr, qc = e[0] + dr, e[1] + dc     # extension cell after the run
-        if (0 <= qr < n_rows and 0 <= qc < n_cols
-                and bd[qr * n_cols + qc] == 0 and conn(e[0], e[1], dr, dc)):
-            total += 1
+        if L >= 4:                       # straight four: classic extensions
+            cand.append((s[0] - dr, s[1] - dc))
+            cand.append((e[0] + dr, e[1] + dc))
+        for br, bc in cand:
+            if not (0 <= br < n_rows and 0 <= bc < n_cols):
+                continue
+            b = br * n_cols + bc
+            if bd[b] != 0:
+                continue
+            bd[b] = pl
+            if win_check(bd, b):
+                found.add(b)
+            bd[b] = 0
     bd[a] = 0
-    return total
+    return len(found)
 ```
 
-`run_extent` is `line_len` plus the run's two extreme cells (the length is
-the step direction dotted with the end-to-start displacement, which is
-exact for all four unit directions). `four_threat_count` is the atomic
-operation of the open-four layer: place a hypothetical stone, and count
-how many *playable* extension cells the resulting $L = 4$ runs expose —
-each one is a win-in-1 cell the opponent would then have to answer.
+`run_extent` is `line_len` plus the run's two extreme cells, with the
+Chebyshev step count so diagonals are measured correctly. `four_threat_count`
+is the atomic operation of the open-four layer, but it no longer trusts
+contiguous run length alone: it places a hypothetical stone and *validates
+each candidate winning cell with `win_check`*, so overlines (a run of six)
+are rejected and broken fours (`X . X X X`) are counted. This is the "count
+distinct, actual exact-five completion cells" formulation — it handles
+straight fours, broken fours and intersecting threats consistently.
 
 ---
 
@@ -336,7 +335,7 @@ class Node:
     child and are kept from the perspective of the player who made the
     move leading to it (the parent's player to move)."""
     __slots__ = ('board', 'player', 'children', 'untried', 'prior',
-                 'N', 'W', 'Q', 'terminal_value')
+                 'N', 'W', 'Q', 'terminal_value', 'empties')
 
     def __init__(self, board, player):
         self.board = board          # flat list, player to move = `player`
@@ -497,23 +496,19 @@ The descent itself is the simulation's outer walk:
 
 ```python
 node, path = root, []
-leaf_is_terminal = False
 while True:
     if node.terminal_value is not None:
-        leaf_is_terminal = True
-        break
+        break                            # game already decided at `node`
     if node.children is None:            # first visit: expand
         expand(node, None, rich=False)
     if node.untried:                     # expansion phase
-        node.N += 1
         a = node.untried.pop()
         child = create_child(node, a)
         node.children[a] = child
         path.append((node, a))
         node = child
         break
-    node.N += 1                          # selection phase
-    a = puct_select(node)
+    a = puct_select(node)                # selection phase
     path.append((node, a))
     node = node.children[a]
 ```
@@ -521,19 +516,31 @@ while True:
 Four exits, in priority order:
 
 1. **Terminal node** — $z(s)$ was stamped at creation; the exact score is
-   known, no evaluation needed.
+   known, no evaluation needed. The check consults `node.terminal_value`
+   itself, so a child that *became* terminal during this descent (a freshly
+   created child, or a pre-existing one) is recognised without a separate
+   flag.
 2. **First visit** — `children is None`: the state has never been seen, so
-   build its action set and priors.
+   build its action set and priors.  **Tactical priority:** for non-root
+   nodes the action set is first filtered — if the mover has an immediate
+   win, only the winning moves are kept; otherwise, if the opponent has one,
+   only the blocking moves are kept.  Candidate cells are restricted to those
+   adjacent to a stone (a five must include one), so the filter stays cheap.
+   This makes forced sequences real search lines instead of relying on
+   proximity priors and random rollouts to notice them.
 3. **Untried actions left** — the node is not fully expanded:
    `untried.pop()` takes the **highest-prior untried action** (the list is
    prior-ascending) — the prior-guided equivalent of
    `select_arbitrary_unvisited`. Create the child, record `(node, action)`
    in `path`, descend, and break: this fresh leaf is what gets evaluated.
-   $N(s) \mathrel{+}= 1$ because the parent was visited by this simulation.
-4. **Fully tried** — PUCT-select and keep descending. $N(s) \mathrel{+}= 1$
-   appears in *both* branches 3 and 4 because $N(s)$ must count every
-   simulation passing through — it is the $\sum_b N(s,b)$ under the square
-   root.
+4. **Fully tried** — PUCT-select and keep descending.
+
+Visits are **not** incremented during descent.  The root is incremented once
+per completed simulation and every traversed child exactly once during
+backpropagation (see *Phase 4*).  The old code also incremented each node as
+it was descended, so non-root visits were counted twice while values were
+summed once — which inflated the denominator of $Q$ and the PUCT exploration
+term.  Counting only in the backup phase keeps $N(s) = \sum_b N(s,b)$ exact.
 
 Every traversed edge is recorded in `path = [(node, action), ...]` from
 root to leaf — exactly the route backpropagation will walk.
@@ -633,14 +640,18 @@ at $\kappa = 1.5$ is exactly the threat taxonomy of the glossary:
 | closed 2 | 2 | 0 | 1 |
 | open 2 / closed 3 | 2 / 3 | 2 / 0 | 4 |
 | closed 4 | 4 | 0 | 9 |
+| four, one end | 4 | 1 | 22.5 |
 | **open 3** | 3 | 2 | **16** |
 | **open 4** | 4 | 2 | **36** |
 
-An **open 3** (16) outranks a **closed 4** (9) — correct, since a closed 4
-is one blockable win-in-1 cell while an open 3 is a forced-loss trajectory
-— but an **open 4** (36) towers over everything, as a forced win should.
-(Exact win-in-1 cells are handled by the root hard rules below; the
-evaluator only needs the right *ranking*.) Then
+An **open 3** (16) outranks a **fully dead** four (9), but a **one-ended
+four** (22.5) outranks the open 3. That ordering is deliberate — a
+one-ended four is a winning threat that must be answered *now* — but it is
+the reason the evaluator alone cannot be trusted to defend against one:
+a heuristic score is not a tactical guarantee. The hard rules and the
+search handle forced lines; the evaluator only needs the right *ranking*
+at rollout cutoffs. An **open 4** (36) towers over everything, as a forced
+win should. Then
 
 $$
 \tilde V(s) \;=\; \frac{\Phi_{+1}(s) - \Phi_{-1}(s)}
@@ -768,10 +779,13 @@ runs (today's behaviour as the baseline), and the resulting ranking —
 open 3 (16) > closed 4 (9) — matches the glossary's threat taxonomy. A
 full $6 \times 3$ lookup table would be more expressive but adds ~18
 hand-tuned entries for second-order gains; the search's $Q$ values should
-resolve those, not the evaluator. What $g$ deliberately does *not* capture
-— gap patterns like `● ● . ● ●` — is handled by the tree (which tries the
-gap cell) and the root win-in-1 rules; the evaluator only needs to be a
-good *average* signal at rollout cutoffs.
+resolve those, not the evaluator. Note the honest ranking: open 3 (16) beats
+a *fully dead* four (9) but loses to a *one-ended* four (22.5) — so raising
+$\kappa$ cannot, by itself, make the evaluator defend a one-ended four; that
+is what the hard rules and the search are for. What $g$ deliberately does
+*not* capture — gap patterns like `● ● . ● ●` — is handled by the tree
+(which tries the gap cell) and the root win-in-1 rules; the evaluator only
+needs to be a good *average* signal at rollout cutoffs.
 
 **Why the $(L-1)^2$ weighting?** It makes urgency **convex** — each extra
 stone is worth disproportionately more:
@@ -812,14 +826,19 @@ v_{t-1} = -v_t
 $$
 
 ```python
-# evaluation phase
-if leaf_is_terminal:
+# evaluation phase: a freshly created child may already be terminal
+# (create_child sets terminal_value), so consult the node's own state rather
+# than a descent-time flag -- otherwise a finished game would be rolled out
+# and a forced win evaluated as a random playout.
+if node.terminal_value is not None:
     v = node.terminal_value              # for the player to move here
 else:
     v = rollout(node)
-node.N += 1
 
-# backpropagation: flip the sign at each level up the tree
+# backpropagation: exactly one visit per traversed node.  The root is counted
+# once here; every traversed child is counted once below.  The sign flips at
+# each level.
+root.N += 1
 v = -v
 for pnode, a in reversed(path):
     ch = pnode.children[a]
@@ -840,7 +859,8 @@ A terminal leaf reached by *descent* (not fresh creation) enters the same
 loop with $v = z(s)$: identical accounting, because $z$ is already stored
 from that node's player-to-move perspective. Both `path` entries were
 appended *before* descending, so `pnode.children[a]` is exactly the child
-that was visited.
+that was visited. The same code path also catches a leaf that became
+terminal *during* creation, which is why the descent flag was removed.
 
 ---
 
@@ -950,6 +970,17 @@ expand(root, root_actions, rich=True)
   root's action set is therefore **restricted to
   $\mathcal{A}(s_0) \leftarrow \mathcal{W}_{-p}$**.
 - A single candidate → return without searching.
+- **The same priority applies at search nodes.** The root hard rules are the
+  cheap pre-search version; `expand` applies the same filter when it builds a
+  non-root node's action set: if the mover has an immediate win, only the
+  winning moves are kept; otherwise, if the opponent has one, only the
+  blocking moves are kept. Candidate cells are restricted to those adjacent to
+  a stone (a five must include one), so the filter stays cheap. This makes
+  forced reply sequences — "fight threes with fours" — actual search lines
+  rather than trusting proximity priors and random rollouts to notice them.
+  Note the limitation: admission to $F$ is not proof that the whole
+  continuation is safe; the search must still verify the forced sequence
+  rather than treating a counterattack as equivalent to a direct defence.
 
 ### The open-four threat layer ($M$, $F$, $O$)
 
@@ -960,9 +991,12 @@ T_p(a) \;=\; \bigl|\{\, \text{win-in-1 cells for } p \text{ after placing a ston
 $$
 
 Only the four lines through $a$ can change, so `four_threat_count` places
-the stone, walks each direction with `run_extent` (length + both extreme
-cells of the resulting run), and counts the **playable extension cells**
-of every resulting $L = 4$ run. Then:
+the stone and validates each candidate within four steps along the four
+lines through $a$ with `win_check` — it no longer trusts contiguous run
+length alone.  This rejects overlines (a run of six, which the rules do not
+count) and catches broken fours (`X . X X X`) whose gap is the winning cell.
+`run_extent` is still used to add the classic straight-four extension cells
+to the candidate set.  Then:
 
 $$
 M = \{a : T_p(a) \geq 2\}, \qquad
@@ -1077,17 +1111,41 @@ and was left alone.
 ## Measured result
 
 Identical positions (same seed, same stone placements and edges), identical
-simulation counter injected into both builds, full 4.7 s budget:
+simulation counter injected into both builds, full 4.7 s budget, medians of
+three runs per position:
 
-| Position | v2 (sims/s) | v3 / HEAD (sims/s) | Speed-up |
-| --- | --- | --- | --- |
-| empty board | 2,628 | **3,765** | **+43 %** |
-| early game (12 stones) | 1,518 | **1,994** | **+31%** |
-| black open three (search case) | 1,973 | **2,247** | **+14%** |
+| Position | v1 (sims/s) | v2 (sims/s) | v3 (sims/s) | v4 (sims/s) | v3 vs v2 | v4 vs v3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| empty board | 3,198 | 3,203 | 3,577 | 3,514 | **+11.7 %** | −1.8 % |
+| early game (12 stones) | 2,168 | 1,784 | 1,877 | 1,591 | **+5.2 %** | −15.2 % |
+| early game (12 stones, White) | 2,237 | 1,954 | 2,152 | 2,076 | **+10.1 %** | −3.6 % |
+| **mean** | **2,534** | **2,314** | **2,536** | **2,394** | **+9.6 %** | **−5.6 %** |
+
+> **Correction (5 Nov 2026).** An earlier version of this section claimed
+> +43 %/+31 %/+14 % for v3 over v2, from single runs per position.  Repeating
+> each position three times and taking medians shows the honest figure is
+> **+9.6 % in mean sims/s**, not +31–43 %.  The single runs were dominated by
+> run-to-run spread; the direction is right, but the magnitude was overstated.
+>
+> Two further points the repeated measurement makes clear.  First, v3 is **not**
+> faster than v1 overall (**+0.1 %** mean): it gains ~12 % on the empty board
+> but loses ~13 % on stone-heavy positions.  Second, v2's openness-aware
+> evaluator and threat layer cost about 9 % speed, and v3's optimisations
+> recovered exactly that — the optimisations did not exceed the pre-v2
+> baseline.  "v3" therefore means *faster than v2, equal to v1*, not the
+> headline speed-up once quoted.
+>
+> **v4 (the current build) is the correctness pass on top of v3**: exact
+> diagonal threat lengths, exact threat counting, honest visit accounting,
+> no rollout of finished games, and the tactical action filter at search
+> nodes.  It gives up **5.6 %** mean sims/s against v3 — concentrated on
+> stone-heavy positions (−15 %), almost free on the empty board (−1.8 %),
+> because the new `expand` filter needs candidate cells adjacent to a stone.
+> In exchange it wins **95.8 %** of 120 games against v3.  See
+> `benchmarks/results/version_comparison.md` for the full head-to-head data.
 
 (An older measurement quoting ~7,000 sims/s predates v2's open-four threat
-layer and openness-aware evaluator; only the HEAD-vs-v2 table above is
-apples-to-apples.)
+layer and openness-aware evaluator; only the table above is apples-to-apples.)
 
 ### Why not more?
 
@@ -1249,9 +1307,135 @@ are guarded by:
 3. **Timing compliance**: full-budget moves still land at ~4.72–4.75 s,
    inside the 5 s rule.
 
+> **Status note.** These safeguards describe v3 as originally shipped. The
+> review pass below changes the threat layer (`run_extent`,
+> `four_threat_count`), the MCTS visit accounting, and the expansion filter,
+> so the property test and behavioural suites **must be re-run against the
+> updated code** before the "0 mismatches" figures are quoted again.
+
 > **Lesson for the report.** The diagonal bug appeared *three* times in
 > different disguises (`conn`, `_edge_idx`, and the inlined evaluator), each
 > time because a branch tested `dr` alone instead of `dr` **and** `dc`. In
 > this game variant the anti-diagonal must never be treated as a vertical
 > edge. A single property test comparing against a reference implementation
 > caught all three — much cheaper than debugging losses during play.
+
+---
+
+## Review fixes (post-v3 correctness pass)
+
+A code review of the v3 search found six issues. All are fixed in
+`project_skeleton.py`; the sections above have been updated to match. This
+list is the authoritative changelog.
+
+### 1. Diagonal run length was doubled (`run_extent`)
+
+The run length was computed as the dot product
+`(e_r - s_r) * dr + (e_c - s_c) * dc + 1`. That is exact for horizontal and
+vertical steps, but for a diagonal step *both* coordinates advance by one per
+step, so the result was `2L - 1` — a run of 3 was reported as 5. Since the
+open-four layer only inspects runs with `L == 4`, **both diagonal
+orientations were silently excluded from threat detection**: on an otherwise
+empty board, an opponent's diagonal open three produced 0 threats instead of 2,
+leaving all 218 empty cells as candidate replies.
+
+The fix is the Chebyshev step count, `max(|e_r - s_r|, |e_c - s_c|) + 1`,
+which equals the true number of steps in all four unit directions. The
+diagonal examples had still "happened to" block in play, but that was MCTS
+choosing the move, not the hard rule forcing it — protection that disappears
+once competing attractions exist.
+
+### 2. Threat count was not an exact count of winning moves (`four_threat_count`)
+
+Two further defects in the contiguous-run counter:
+
+- **It counted extensions that produce six stones.** After finding a four, it
+  counted an empty connected endpoint without checking what lay beyond it. In
+  `. X X X X . X`, filling the marked gap produces six, which the rules do not
+  count, yet the helper reported a winning cell — and $M$ returns such a move
+  as a "forced win".
+- **It missed broken fours.** A pattern such as `X . X X X` has an immediate
+  winning gap, but the counter only considered contiguous runs of length four
+  and reported zero.
+
+The replacement places the stone and **validates each candidate with
+`win_check`** — the "count distinct, actual exact-five completion cells"
+formulation. Overlines are rejected (a run of six does not satisfy
+`line_len == 5`) and broken fours are caught (the gap cell completes five).
+`run_extent` is retained only to add the classic straight-four extension cells
+to the candidate set. This handles straight fours, broken fours and
+intersecting threats consistently.
+
+### 3. "Respond to an open three" is not always "block its endpoint"
+
+The $F \cup O$ restriction deliberately admits our own forcing fours, which can
+be correct — but admission to $F$ is **not proof that the continuation is
+safe**: the deeper search used proximity priors and random rollouts rather than
+consistently playing forced tactical replies. Two mitigations were applied:
+
+- **Tactical priority at search nodes.** `expand` now filters a non-root
+  node's action set: if the mover has an immediate win, only winning moves are
+  kept; otherwise, if the opponent has one, only the blocking moves are kept.
+  Candidates are restricted to cells adjacent to a stone (a five must include
+  one), so the filter stays cheap. Forced reply sequences become real search
+  lines.
+- **Exact threat detection** (fix 2) makes the forcing moves themselves
+  trustworthy, which is the prerequisite for the filter to help.
+
+A full "threat-space" reply-sequence search remains the next step; the filter
+above is the bounded-cost version.
+
+### 4. MCTS visit counts were doubled
+
+Visits were incremented during descent (`node.N += 1` in both the expansion and
+selection branches) **and** at the leaf, **and** again during backup. Non-root
+visits were therefore counted twice while values were accumulated once: one
+measured search reported `root.N = 2242` but `sum(root child.N) = 4484`. This
+inflates the denominator of $Q$ and the PUCT exploration term.
+
+Fix: count the root once per completed simulation, and each traversed child
+exactly once during backpropagation. The descent-time increments were removed.
+The invariant $N(s) = \sum_b N(s,b)$ now holds.
+
+### 5. Newly created terminal nodes were rolled out
+
+`create_child` stamps `terminal_value`, but the descent broke out without
+updating `leaf_is_terminal`, so the evaluation phase could run a random playout
+from an already-finished game. Fix: consult the node's own state —
+
+```python
+if node.terminal_value is not None:
+    v = node.terminal_value
+else:
+    v = rollout(node)
+```
+
+— so a forced win created during the descent is evaluated as the win it is.
+
+### 6. Random-index `pop`, not swap-pop
+
+`empties.pop(int(...))` shifts the remaining list; it is not swap-pop (an
+earlier comment said otherwise and was corrected). An isolated microbenchmark on
+Python 3.13 — 30 000 repetitions of removing 32 elements from a 221-element
+list — measured **0.0874 s** for random-index pop versus **0.0995 s** for
+swap-then-pop: swap-pop was about **14 % slower**. The current removal method is
+kept; "optimising" it to swap-pop needs a full-engine benchmark first.
+
+### 7. Evaluator ranking claim corrected
+
+The notes previously said an open three "outweighs a closed four". The formula
+$g(L,e) = (L-1)^2(1+\kappa e)$ at $\kappa = 1.5$ gives open 3 (16) versus a
+**fully dead** four (9) — but a **one-ended** four is 22.5 and outranks the open
+three. So the heuristic ranks threats correctly but is *not* a tactical
+guarantee against a one-ended four; that is the hard rules' and the search's
+job. The text above was corrected accordingly.
+
+### Order of application (and a tuning caveat)
+
+The review's recommended order was: fix diagonal lengths → make threat counts
+exact → repair visit/terminal handling → add tactical replies deeper in search
+→ optimise expansion and evaluation. **Retune MCTS parameters only afterwards**,
+because the previous tuning was compensating for incorrect statistics. In
+particular the earlier $C_{PUCT} = 1.4$ settlement was measured on the buggy
+visit counts and threat layer, so its verdict should be re-run before being
+trusted.

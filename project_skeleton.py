@@ -269,31 +269,53 @@ def best_move(state, color):
             e_r, e_c = fr, fc
             fr += dr
             fc += dc
-        L = (e_r - s_r) * dr + (e_c - s_c) * dc + 1   # dot with the unit step
+        # Chebyshev distance: for a horizontal step only |dc| grows and for a
+        # vertical step only |dr| grows, but for a diagonal BOTH grow by 1 per
+        # step.  The old dot product (e-s).(dr,dc) therefore counted diagonal
+        # runs twice (L=3 reported as 5), so no diagonal four was ever seen as
+        # a four by the threat layer.  max(|dr|,|dc|) is the true step count in
+        # all four directions.
+        L = max(abs(e_r - s_r), abs(e_c - s_c)) + 1
         return L, (s_r, s_c), (e_r, e_c)
 
     def four_threat_count(bd, a, pl):
-        """Number of win-in-1 cells colour `pl` would gain by placing a
-        stone at flat index a (only the four lines through a can change).
-        Requires: a is empty and no win-in-1 cells for pl exist on bd yet
-        (both hold at the point of use: mine/theirs were handled first)."""
+        """Exact number of distinct empty cells that become immediate winning
+        moves for `pl` after `pl` plays at flat index a.
+
+        Every candidate within four steps of `a` along the four lines through
+        `a` is validated by placing a stone and calling win_check.  This
+        rejects a "win" that would actually make a run of six (an overline,
+        which the rules do not count) and catches a broken four such as
+        ``X . X X X`` whose gap is the winning cell.  The old contiguous-run
+        counter missed both cases (and doubled diagonal lengths), so the
+        candidates are now validated directly.
+
+        Requires: `a` is empty and no win-in-1 cells for `pl` exist on `bd`
+        yet (both hold at the point of use: mine/theirs were handled first).
+        """
         r, c = divmod(a, n_cols)
         bd[a] = pl
-        total = 0
+        found = set()
         for dr, dc in DIRS4:
+            cand = [(r + k * dr, c + k * dc)
+                    for k in (-4, -3, -2, -1, 1, 2, 3, 4)]
             L, s, e = run_extent(bd, r, c, dr, dc)
-            if L != 4:
-                continue
-            pr, pc = s[0] - dr, s[1] - dc     # extension cell before the run
-            if (0 <= pr < n_rows and 0 <= pc < n_cols
-                    and bd[pr * n_cols + pc] == 0 and conn(pr, pc, dr, dc)):
-                total += 1
-            qr, qc = e[0] + dr, e[1] + dc     # extension cell after the run
-            if (0 <= qr < n_rows and 0 <= qc < n_cols
-                    and bd[qr * n_cols + qc] == 0 and conn(e[0], e[1], dr, dc)):
-                total += 1
+            if L >= 4:
+                # straight four: the classic two extension cells
+                cand.append((s[0] - dr, s[1] - dc))
+                cand.append((e[0] + dr, e[1] + dc))
+            for br, bc in cand:
+                if not (0 <= br < n_rows and 0 <= bc < n_cols):
+                    continue
+                b = br * n_cols + bc
+                if bd[b] != 0:
+                    continue
+                bd[b] = pl
+                if win_check(bd, b):
+                    found.add(b)
+                bd[b] = 0
         bd[a] = 0
-        return total
+        return len(found)
 
     class Node:
         """Search-tree node.  Edge statistics (N, W, Q) are stored on the
@@ -348,6 +370,36 @@ def best_move(state, color):
         """Create the action set of `node` with heuristic priors P(s, a)."""
         if actions is None:
             actions = node.empties   # set at creation; no rescan needed
+            # ---- tactical priority at search nodes (not just the root) ----
+            # If the player to move has an immediate win, explore only winning
+            # moves.  Otherwise, if the opponent has an immediate win, explore
+            # only the blocking moves.  This makes forced reply sequences
+            # (fight threes with fours) actual search lines instead of relying
+            # on proximity priors and random rollouts to notice them.  A five
+            # must include a cell adjacent to an existing stone, so only those
+            # candidate cells need testing.
+            board = node.board
+            me = node.player
+            cand = [a for a in actions
+                    if any(board[j] != 0 for j in neighbors8[a])]
+            if cand:
+                wins = []
+                for a in cand:
+                    board[a] = me
+                    if win_check(board, a):
+                        wins.append(a)
+                    board[a] = 0
+                if wins:
+                    actions = wins
+                else:
+                    blocks = []
+                    for a in cand:
+                        board[a] = -me
+                        if win_check(board, a):
+                            blocks.append(a)
+                        board[a] = 0
+                    if blocks:
+                        actions = blocks
         if rich:
             scores = rich_scores(node.board, node.player, actions)
         else:
@@ -386,8 +438,10 @@ def best_move(state, color):
     def static_eval(bd, for_player):
         """Static evaluation in [-1, 1] from `for_player`'s perspective:
         openness-weighted squared lengths of all maximal connected lines,
-        (L-1)^2 * (1 + KAPPA * playable_ends).  An open 3 thus outweighs a
-        closed 4, which is the fix for the open-three blindness.
+        (L-1)^2 * (1 + KAPPA * playable_ends).  An open 3 (16) outweighs a
+        fully dead four (9) but NOT a one-ended four (22.5): the score ranks
+        threats, it is not a tactical guarantee -- forced lines are handled by
+        the hard rules and by the search.
 
         The per-direction edge lookups are inlined (ehF/evF) instead of
         going through conn(): this loop runs once per simulation."""
@@ -469,7 +523,7 @@ def best_move(state, color):
         """Depth-capped random playout; returns the value from the
         perspective of the player to move at `node`."""
         bd = node.board[:]            # scratch copy
-        empties = list(node.empties)  # copy; swap-pop mutates it
+        empties = list(node.empties)  # copy; pop mutates it (shifts the tail)
         to_move = node.player
         draw_value = 1.0 if node.player == WHITE else -1.0
         for _ in range(ROLLOUT_DEPTH):
@@ -536,34 +590,37 @@ def best_move(state, color):
 
     while time.perf_counter() < deadline:
         node, path = root, []
-        leaf_is_terminal = False
         while True:
             if node.terminal_value is not None:
-                leaf_is_terminal = True
-                break
+                break                        # game already decided at `node`
             if node.children is None:            # first visit: expand
                 expand(node, None, rich=False)
             if node.untried:                     # expansion phase
-                node.N += 1
                 a = node.untried.pop()
                 child = create_child(node, a)
                 node.children[a] = child
                 path.append((node, a))
                 node = child
                 break
-            node.N += 1                          # selection phase
-            a = puct_select(node)
+            a = puct_select(node)                # selection phase
             path.append((node, a))
             node = node.children[a]
 
-        # evaluation phase
-        if leaf_is_terminal:
+        # evaluation phase.  A freshly created child may already be terminal
+        # (create_child sets terminal_value), so consult the node's own state
+        # rather than a descent-time flag: otherwise a finished game would be
+        # rolled out and a forced win evaluated as a random playout.
+        if node.terminal_value is not None:
             v = node.terminal_value              # for the player to move here
         else:
             v = rollout(node)
-        node.N += 1
 
-        # backpropagation: flip the sign at each level up the tree
+        # backpropagation: exactly one visit per traversed node.  The root is
+        # counted once here; every traversed child is counted once below (the
+        # descent used to increment each node as well, so non-root visits were
+        # counted twice while values were summed once -- which distorted Q and
+        # the PUCT exploration term).  The sign flips at every level.
+        root.N += 1
         v = -v
         for pnode, a in reversed(path):
             ch = pnode.children[a]
