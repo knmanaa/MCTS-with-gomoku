@@ -131,10 +131,49 @@ def check_result(state):
         You can write between the two rows of #.
     """
     ###########################################################################
-    
-    
-    
-    
+    board, edgeH, edgeV = state
+    rows, cols = board.shape
+
+    def continues_line(r, c, nr, nc, color):
+        # Test bounds before indexing; negative NumPy indices would wrap.
+        if not (0 <= nr < rows and 0 <= nc < cols):
+            return False
+        if board[nr, nc] != color:
+            return False
+
+        # Horizontal edges belong to the left cell, vertical edges to the upper cell.
+        if r == nr:
+            return edgeH[r, min(c, nc)]
+        if c == nc:
+            return edgeV[min(r, nr), c]
+        return True  # Adjacent diagonal points are always connected.
+
+    for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        for r in range(rows):
+            for c in range(cols):
+                color = board[r, c]
+                # Skip empty cells and any cell that is not the start of its run.
+                if color == 0 or continues_line(r, c, r - dr, c - dc, color):
+                    continue
+
+                length = 1
+                end_r, end_c = r, c
+                while continues_line(end_r, end_c, end_r + dr, end_c + dc, color):
+                    length += 1
+                    end_r += dr
+                    end_c += dc
+
+                # Count the entire connected run so six in a row cannot win.
+                if length == 5:
+                    winning_line = np.array(
+                        [(r + i * dr, c + i * dc) for i in range(5)], dtype=int
+                    )
+                    return True, winning_line
+
+    # Check for a draw only after ruling out a win on the last empty point.
+    if not np.any(board == 0):
+        return True, np.full((5, 2), -1.0)
+
     ###########################################################################
     return False, np.ones((5, 2)) * -1
 
