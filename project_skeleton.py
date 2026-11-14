@@ -175,34 +175,89 @@ def main(human_color):
                          # (r, c) at which a stone has just been placed
     
     ###########################################################################   
-    
-    # Using the sample below, you will see a game window pop out,
-    # then you can click in it to place black stones and see
-    # the computer place white (and highlighted) stones at random positions.
-    
-    while running:                   # this double loop handles
-        for event in pg.event.get(): # all events you initiate
-            
-            if event.type == pg.QUIT: # detects whether you
-                running = False       # try to close the window
-            
-            if (event.type == pg.MOUSEBUTTONDOWN # detects whether you
-                                                 # click in the window                   
-                and not gameover): # and allows the board to change
-                                   # only before the game ends, i.e.
-                                   # the window is locked after it
+    if human_color not in (+1, -1):
+        running = False
 
-                x, y = event.pos # the position at which you click
-                                 # (0, 0) is the top left corner of the window
+    current_color = +1
+    while running:
+        for event in pg.event.get():
+
+            if event.type == pg.QUIT:
+                running = False
+                break
+
+            if (event.type == pg.MOUSEBUTTONDOWN
+                    and not gameover
+                    and current_color == human_color):
+                if event.button != 1:
+                    continue
+
+                x, y = event.pos
+                r = round((y - PAD_y) / SEP_y)
+                c = round((x - PAD_x) / SEP_x)
+
+                if not (0 <= r < NUM_OF_ROWS and
+                        0 <= c < NUM_OF_COLS):
+                    continue
+
+                if board[r, c] != 0:
+                    continue
+
+                board[r, c] = current_color
+
+                if previous_move is not None:
+                    previous_r, previous_c = previous_move
+                    previous_color = board[previous_r, previous_c]
+                    draw_stone(surface, previous_r, previous_c, previous_color)
+
+                draw_stone(surface, r, c, current_color, highlight=True)
                 
-                r = round( (y-PAD_y) / SEP_y )
-                c = round( (x-PAD_x) / SEP_x )
-                draw_stone(surface, r, c, +1, highlight=False)
-                
-                r, c = best_move(state, -1)
-                draw_stone(surface, r, c, -1, highlight=True)
-                
-    # You can remove this sample.
+                previous_move = (r, c)
+
+                gameover, winning_line = check_result(state)
+
+                if not gameover:
+                    current_color = -current_color
+        
+        if running and not gameover and current_color != human_color:
+            r, c = best_move(state, current_color)
+
+            if (0 <= r < NUM_OF_ROWS and
+                    0 <= c < NUM_OF_COLS and
+                    board[r, c] == 0):
+
+                board[r, c] = current_color
+
+                if previous_move is not None:
+                    previous_r, previous_c = previous_move
+                    previous_color = board[previous_r, previous_c]
+                    draw_stone(surface, previous_r, previous_c, previous_color)
+
+                draw_stone(surface, r, c, current_color, highlight=True)
+                previous_move = (r, c)
+
+                gameover, winning_line = check_result(state)
+
+                if not gameover:
+                    current_color = -current_color
+        if gameover and not congratulated:
+            if np.all(winning_line == -1):
+                print_result(surface, 0)
+            else:
+                first_r, first_c = winning_line[0]
+                winner = board[first_r, first_c]
+
+                for win_r, win_c in winning_line:
+                    draw_stone(
+                        surface, win_r, win_c,
+                        winner, highlight=True
+                    )
+
+                print_result(surface, winner)
+
+            congratulated = True
+
+        pg.time.wait(10)
                 
     ###########################################################################
     
