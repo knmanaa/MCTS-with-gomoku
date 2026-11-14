@@ -175,8 +175,7 @@ def main(human_color):
                          # (r, c) at which a stone has just been placed
     
     ###########################################################################   
-    if human_color not in (+1, -1):
-        running = False
+    self_play = abs(human_color) != 1
 
     current_color = +1
     while running:
@@ -188,6 +187,7 @@ def main(human_color):
 
             if (event.type == pg.MOUSEBUTTONDOWN
                     and not gameover
+                    and not self_play
                     and current_color == human_color):
                 if event.button != 1:
                     continue
@@ -219,8 +219,16 @@ def main(human_color):
                 if not gameover:
                     current_color = -current_color
         
-        if running and not gameover and current_color != human_color:
+        if (running and not gameover
+                and (self_play or current_color != human_color)):
             r, c = best_move(state, current_color)
+            for pending_event in pg.event.get(
+                    [pg.QUIT, pg.MOUSEBUTTONDOWN]):
+                if pending_event.type == pg.QUIT:
+                    running = False
+
+            if not running:
+                break
 
             if (0 <= r < NUM_OF_ROWS and
                     0 <= c < NUM_OF_COLS and
