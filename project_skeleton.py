@@ -113,9 +113,9 @@ def best_move(state, color):
     #     proximity), computed from the board alone
     #   * value network V(s)   -> depth-capped random rollouts, with a static
     #     evaluation function at the cutoff
-    # The PUCT selection, expansion, and sign-alternating backup follow the
-    # standard scheme; the final move is the most-visited root action
-    # (temperature tau -> 0).
+    # PUCT selection, sign-alternating backup, and the final most-visited
+    # root action follow the standard scheme.  Expansion uses prior-guided
+    # progressive widening: low-prior branches are deferred, never deleted.
     #
     # Game-specific points:
     #   * a line of EXACTLY five stones wins, and consecutive stones must be
@@ -128,13 +128,19 @@ def best_move(state, color):
     #
     # Tunables can be overridden from outside for benchmarking WITHOUT
     # editing this file (they default to the values below):
-    #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA
+    #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA,
+    #   MCTS_PW_MIN, MCTS_PW_C
 
     t0 = time.perf_counter()
     TIME_LIMIT    = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
     C_PUCT        = globals().get('MCTS_C_PUCT', 1.4)
     ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
     KAPPA         = globals().get('MCTS_KAPPA', 1.5)
+    # Progressive widening: a node starts with a small, prior-ordered action
+    # set and admits another action once it has enough visits.  All actions
+    # remain eligible; this delays low-prior branches instead of deleting them.
+    PW_MIN        = max(1, int(globals().get('MCTS_PW_MIN', 6)))
+    PW_C          = max(0.0, float(globals().get('MCTS_PW_C', 2.0)))
     deadline = t0 + TIME_LIMIT
     event_poll = globals().get('_MCTS_EVENT_POLL')
     next_poll = t0
@@ -304,7 +310,7 @@ def best_move(state, color):
         child and are kept from the perspective of the player who made the
         move leading to it (the parent's player to move)."""
         __slots__ = ('board', 'player', 'children', 'untried', 'prior',
-                     'N', 'W', 'Q', 'terminal_value', 'empties')
+                     'prior_mass', 'N', 'W', 'Q', 'terminal_value', 'empties')
 
         def __init__(self, board, player):
             self.board = board          # flat list, player to move = `player`
@@ -312,6 +318,7 @@ def best_move(state, color):
             self.children = None        # dict {action: Node}, set on expansion
             self.untried = None         # actions not yet tried, prior-ascending
             self.prior = None           # dict {action: P(s, a)}
+            self.prior_mass = 0.0       # sum of priors of admitted children
             self.N = 0                  # visit count N(s)
             self.W = 0.0                # total action value
             self.Q = 0.0                # mean action value W / N
@@ -395,13 +402,28 @@ def best_move(state, color):
         # ascending by prior, so that list.pop() yields the best-prior action
         node.untried = [a for _, a in sorted(zip(scores, actions))]
         node.children = {}
+        node.prior_mass = 0.0
+
+    def widening_width(node):
+        """Maximum admitted children at the node's current visit count.
+
+        width(N) = min(|A|, max(PW_MIN, floor(PW_C * sqrt(N + 1)))).  The
+        square-root growth lets visits deepen promising lines first, while
+        every legal action remains eligible once the budget is large enough.
+        """
+        return min(len(node.prior), max(PW_MIN, int(PW_C * (node.N + 1) ** 0.5)))
+
+    def can_widen(node):
+        return bool(node.untried) and len(node.children) < widening_width(node)
 
     def puct_select(node):
-        """PUCT: argmax_a Q(s, a) + c_puct * P(s, a) * sqrt(N(s)) / (1 + N(s, a))."""
+        """PUCT among admitted children, with priors renormalised to their
+        currently admitted mass so widening does not shrink exploration."""
         sq_n = node.N ** 0.5
+        inv_mass = 1.0 / node.prior_mass if node.prior_mass > 0.0 else 0.0
         best_a, best_s = None, -1e18
         for a, ch in node.children.items():
-            s = ch.Q + C_PUCT * node.prior[a] * sq_n / (1 + ch.N)
+            s = ch.Q + C_PUCT * (node.prior[a] * inv_mass) * sq_n / (1 + ch.N)
             if s > best_s:
                 best_s, best_a = s, a
         return best_a
@@ -528,10 +550,11 @@ def best_move(state, color):
                 break                        # game already decided at `node`
             if node.children is None:            # first visit: expand
                 expand(node, None, rich=False)
-            if node.untried:                     # expansion phase
+            if can_widen(node):                   # progressive widening
                 a = node.untried.pop()
                 child = create_child(node, a)
                 node.children[a] = child
+                node.prior_mass += node.prior[a]
                 path.append((node, a))
                 node = child
                 break

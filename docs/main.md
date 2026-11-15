@@ -155,5 +155,5 @@ how many turns were played.
 - Add finer cooperative checkpoints if larger boards need tighter close
   latency, without treating partially computed tactical sets as complete.
 - Keep draw detection separate from the rule awarding White the game.
-- Search-strength work such as progressive widening and tactical rollouts
-  is described as **not yet enabled** in [the search recommendations](<best_move.md#10-recommended-next-work--not-implemented>).
+- Progressive widening is now enabled in the search; tactical rollouts and
+  tree reuse remain future work in [the search recommendations](<best_move.md#10-recommended-next-work--not-implemented>).

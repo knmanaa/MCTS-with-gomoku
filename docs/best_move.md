@@ -18,12 +18,13 @@ The algorithm is **PUCT Monte Carlo tree search without deep learning**:
 | --- | --- |
 | Policy prior | Handcrafted line-extension, blocking, proximity, and centre scores |
 | Leaf value | Depth-capped uniformly random rollout, then a static line evaluator |
-| Tree policy | PUCT selection, one-child expansion, alternating-sign backup |
+| Tree policy | Prior-guided progressive widening, then PUCT selection |
+| Backup | Alternating-sign backup with one visit per traversed edge |
 | Final decision | Most-visited root action; mean value breaks ties |
 | Tactical exceptions | Exact immediate wins, necessary replies, and root fork handling |
 
-Progressive widening, tactical rollout policies, tree reuse, and incremental
-value updates are **not enabled** in the current implementation.
+Progressive widening is enabled by default. Tactical rollout policies, tree
+reuse, and incremental value updates remain future work.
 
 ## Algorithm overview and notation
 
@@ -44,7 +45,8 @@ evidence and domain knowledge suggest it is useful.
 One simulation follows four phases:
 
 1. **Selection:** descend through previously explored actions using PUCT.
-2. **Expansion:** add one previously unvisited action and its child state.
+2. **Expansion:** if the node has room under its widening schedule, admit the
+   highest-prior unvisited action and create its child state.
 3. **Evaluation:** use an exact terminal outcome, or a short random playout
    followed by a static estimate.
 4. **Backpropagation:** send the result up the path, updating action statistics
@@ -242,6 +244,8 @@ TIME_LIMIT = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
 C_PUCT = globals().get('MCTS_C_PUCT', 1.4)
 ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
 KAPPA = globals().get('MCTS_KAPPA', 1.5)
+PW_MIN = globals().get('MCTS_PW_MIN', 6)
+PW_C = globals().get('MCTS_PW_C', 2.0)
 deadline = t0 + TIME_LIMIT
 ```
 
@@ -251,6 +255,13 @@ deadline = t0 + TIME_LIMIT
 | `MCTS_C_PUCT` | `1.4` | PUCT exploration coefficient |
 | `MCTS_ROLLOUT_DEPTH` | `32` | Maximum rollout plies before static evaluation |
 | `MCTS_KAPPA` | `1.5` | Playable-end weight in the static evaluator |
+| `MCTS_PW_MIN` | `6` | Minimum admitted children per expanded node |
+| `MCTS_PW_C` | `2.0` | Square-root growth coefficient for widening |
+
+The widening defaults were selected from paired experiments summarised in
+[Section 9](<#9-integration-review-measured-results-and-verification>). They
+are implementation defaults, not a claim of global optimality; the full
+4.7-second budget was not used for the tuning matches.
 
 Overrides can be assigned by an external caller without editing the function.
 Use suitable numeric values and a nonnegative integer rollout depth. The
@@ -547,10 +558,79 @@ added it. With all-zero scores on a 221-cell empty board, every prior became
 `1`, so their sum was `221` instead of `1`. The corrected denominator
 normalises even an all-zero score list.
 
-Actions are sorted ascending by score so `untried.pop()` expands the
-highest-prior unvisited action. **The current implementation expands every
-retained action before revisiting children using PUCT.** Progressive widening
-is an experimental recommendation, not the current expansion policy.
+Actions are sorted ascending by score so `untried.pop()` admits the
+highest-prior unvisited action first.
+
+### Prior-guided progressive widening
+
+Expanding every action before revisiting any child spends a large fraction of
+the budget broad and shallow: a node with `m` actions receives `m` first visits
+before its most promising action can be revisited. Progressive widening instead
+allocates visits to breadth only as evidence accumulates.
+
+Let `A(s)` be the node's retained action set, `U(s)` its untried actions, and
+`C(s)` its admitted children. Define the integer width
+
+$$
+w(s)=\min\left\{|A(s)|,\;
+\max\left[\,k_{\min},\;
+\left\lfloor k\sqrt{N(s)+1}\right\rfloor\,\right]\right\},
+$$
+
+where `k_min = MCTS_PW_MIN` and `k = MCTS_PW_C`. On each descent through a
+nonterminal node:
+
+1. If `|C(s)| < w(s)` and `U(s)` is nonempty, remove the highest-prior action
+   from `U(s)`, create its child, evaluate that fresh leaf, and stop descending.
+2. Otherwise, choose among the admitted children with PUCT.
+
+The square-root schedule has the usual exploration curve: small visit counts
+buy depth, while later visits gradually widen to the remaining actions. The
+floor at `k_min` guarantees that a newly reached node has several candidate
+replies instead of a single deterministic branch. No action is permanently
+removed: it waits in `U(s)`.
+
+For PUCT at a widened node, renormalise the priors over the children actually
+admitted:
+
+$$
+\bar P(s,a)=\frac{P(s,a)}
+{\displaystyle\sum_{b\in C(s)}P(s,b)},
+\qquad a\in C(s).
+$$
+
+Without this renormalisation, the exploration bonus would shrink merely because
+many untried actions had not yet been admitted. Once all actions are admitted,
+`Pbar = P`. The implementation stores the denominator as `node.prior_mass`
+and updates it whenever a child is admitted.
+
+```python
+def widening_width(node):
+    return min(len(node.prior),
+               max(PW_MIN, int(PW_C * (node.N + 1) ** 0.5)))
+
+def can_widen(node):
+    return bool(node.untried) and len(node.children) < widening_width(node)
+
+# descent:
+if can_widen(node):
+    a = node.untried.pop()        # highest prior, prior-ascending list
+    child = create_child(node, a)
+    node.children[a] = child
+    node.prior_mass += node.prior[a]
+else:
+    a = puct_select(node)
+```
+
+The root obeys the same schedule, but its final choice is necessarily among
+**admitted** root children. Consequently, a very small time budget trades
+broader root coverage for deeper lines. The tactical root rules are evaluated
+before widening and are unaffected. At the default budget, the width at the
+root is normally much larger than `k_min`.
+
+Progressive widening is an allocation rule, not a pruning proof. It assumes
+that low-prior actions are less urgent on average; the exact threat layer
+remains responsible for proving immediate wins, necessary replies, and forks.
 
 ## 6. Selection and value conventions
 
@@ -914,31 +994,33 @@ the flat action index to `(r, c)`.
 
 ## 9. Integration review: measured results and verification
 
-### Runtime measurements
+### Runtime and widening tradeoff
 
-The 15 November review compared the updated working implementation with the
-**pre-review staged integration version**, not a newly selected historical
-commit. On the local Python 3.13 / NumPy 2.5.3 environment, the benchmark used
-the same 17-by-13 positions and edge topology, five random seeds, a
-0.5-second budget, an in-memory simulation counter, and medians of measured
-simulations per elapsed second:
+The earlier scalar-access and exact-tactics review measured an end-to-end
+throughput gain over the pre-review integration code: approximately 22%, 16%,
+and 38% more simulations per second on empty, 16-stone, and 40-stone boards.
+That measurement remains useful for the shared engine work, but it predates
+progressive widening.
 
-| Position | Staged baseline simulations/s | Updated simulations/s | Gain |
+Widening deliberately changes tree shape. With the default schedule
+`k_min = 6`, `k = 2.0`, a separate local five-seed benchmark at a 0.5-second
+budget against the immediately preceding integration HEAD observed:
+
+| Position | Eager-expansion simulations/s | Widened simulations/s | Change |
 | --- | ---: | ---: | ---: |
-| Empty | 2,469 | 3,002 | 22% |
-| 16 stones | 2,058 | 2,386 | 16% |
-| 40 stones | 1,862 | 2,578 | 38% |
+| Empty | 3,398 | 2,474 | −27% |
+| 16 stones | 2,448 | 2,079 | −15% |
+| 40 stones | 2,402 | 2,230 | −7% |
 
-Measured zero-budget setup/tactical/fallback time was approximately
-27–31 ms before and 9–11 ms after. Full-budget probes took approximately
-4.73–4.74 seconds. These are machine- and position-dependent observations,
-not strict bounds or guaranteed speedups. Changing sampling order, priors,
-and pruning also changes the trees explored; the table is an end-to-end
-throughput comparison, not an isolated implementation-only kernel benchmark.
+A simulation that descends deeper is not equivalent to a shallower one, so raw
+simulation count is only a diagnostic. The extra depth is exactly the intended
+trade. Zero-budget setup remained approximately 5 ms in this measurement.
+Full-budget probes stayed around 4.73–4.75 seconds, inside the five-second
+rule on this machine. These are observations, not hardware-independent
+guarantees; a strict deadline remains cooperative rather than preemptive.
 
 Earlier v1–v4 timing and match results describe historical engines and budgets.
-They must not be presented as measurements of this revised integration build.
-Higher simulation throughput does **not** establish higher playing strength.
+They must not be presented as measurements of this build.
 
 ### Correctness checks performed
 
@@ -951,6 +1033,7 @@ Higher simulation throughput does **not** establish higher playing strength.
 | Quiet fork defences | 430 candidate defences across 22 qualifying positions matched exact recomputation |
 | Long runs | Exact-five/overline probes for lengths 4, 5, 6, 7, 20, and 100 passed |
 | Backup and priors | Root visit accounting, `Q = W/N`, and normalised updated priors passed |
+| Progressive widening | Audited width bounds, `prior_mass`, untried/child partition, and root visit count on three positions and four seeds; all passed |
 | GUI integration | Close during actual search, stale-click rejection, one-time result, draw award, and error cleanup passed |
 
 The review-specific differential and GUI checks were executed in memory;
@@ -958,33 +1041,45 @@ they were not added as new maintained test files. Existing behavioural tests
 were run without editing them. All implementation changes were verified to
 remain inside the three original TODO bodies.
 
-### Strength experiment — not a production claim
+### Progressive-widening strength experiments
 
-At **0.1 seconds per move**, four board seeds, and colour-swapped pairings
-against the staged baseline:
+All matches used the same board seeds and **colour-swapped pairings** against
+the immediately preceding engine, which expands every action eagerly. Each
+game is one independent result; “draws” are awarded to White by the rules.
 
-| Candidate | Wins | Losses | Status |
-| --- | ---: | ---: | --- |
-| Revised default | 3 | 5 | Current implementation |
-| Revised search with progressive widening | 6 | 2 | In-memory experiment only; not enabled |
+| Per-move budget | Configuration | Games | Wins | Losses |
+| --- | --- | ---: | ---: | ---: |
+| 0.08 s | `k_min = 6`, `k = 2.0` (default) | 40 | 34 | 6 |
+| 0.08 s | `k_min = 6`, `k = 2.5` | 24 | 21 | 3 |
+| 0.08 s | `k_min = 4`, `k = 2.5` | 40 | 30 | 10 |
+| 0.08 s | `k_min = 8`, `k = 2.0` | 24 | 18 | 6 |
+| 0.08 s | Root eager, deeper widening (`6`, `2.0`) | 16 | 7 | 9 |
+| 0.5 s | `k_min = 6`, `k = 2.0` (default) | 8 | 5 | 3 |
+| 0.5 s | `k_min = 6`, `k = 2.5` | 8 | 4 | 4 |
 
-The widening experiment limited expanded children approximately to
-`max(4, int(2.0 * sqrt(node.N + 1)))`, revisiting existing children with PUCT
-between expansions. These eight-game samples are too small to establish
-strength. Wall-clock-limited games can diverge even with fixed random seeds;
-results from an earlier four-game probe are not additional independent games.
-Some widened games lasted the full board and used White's draw award.
-Neither result supports claiming that the revised default is stronger.
+The low-budget wins are substantial, and a root-eager variant was rejected
+because it spent too much of a small budget broadening the root without
+enough depth. At the 0.5-second budget the advantage shrinks to a small,
+statistically weak sample. The **full 4.7-second deployment budget was not
+played out in this review**, so no claim is made that widening improves
+full-budget strength. The default reflects the stronger low/mid-budget tests
+and the desire to deepen tactical lines; users can restore eager expansion
+with a very large `MCTS_PW_MIN`, or tune `MCTS_PW_C`, and rerun paired matches.
+
+Wall-clock-limited games can diverge even under identical random seeds because
+finite search budgets are not deterministic. The table reports actual games,
+not a theoretical Elo estimate; confidence intervals for these sample sizes are
+wide. Future validation should include more seeds at 4.7 seconds and both
+opening and midgame positions.
 
 ## 10. Recommended next work — not implemented
 
-1. **Progressive widening:** prioritise depth without permanently deleting
-   legal moves. The experiment above is promising but needs more seeds,
-   both colours, multiple budgets including the deployment budget, and
-   exploration/width tuning before becoming the default.
-2. **Cheap tactical rollouts:** prefer immediate wins and necessary blocks
+1. **Cheap tactical rollouts:** prefer immediate wins and necessary blocks
    before random choices. Measure whether lower rollout noise offsets the
    extra per-ply work; retain some exploration.
+2. **Full-budget widening validation:** run paired, colour-swapped matches at
+   the production budget and compare the default, eager expansion, and slower
+   widening schedules. Tune `k_min` and `k` only after that measurement.
 3. **Tree reuse:** retain the matching subtree after real moves, validating
    board, topology, colour, and dimensions before reuse. No tree is currently
    reused between calls.
@@ -998,7 +1093,8 @@ Neither result supports claiming that the revised default is stronger.
    after correctness/expansion changes, using paired matches rather than
    random opponents alone. Preserve regressions for diagonals with no H/V
    edges, broken threes, live-boundary overlines, missing-edge exact fives,
-   last-ply draws, normalised priors, and backup perspective/counts.
+   last-ply draws, normalised priors, widening invariants, and backup
+   perspective/counts.
 
 All proposed search changes remain classical MCTS variants or handcrafted
 heuristics; none requires deep learning or additional production imports.
