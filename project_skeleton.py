@@ -123,18 +123,32 @@ def best_move(state, color):
     #     always connected (same rule as check_result, cf. Figures 2-5)
     #   * a draw counts as a win for White (rules, section 1)
     #   * the input state is never modified
-    #   * the 5-second move limit is respected (4.7 s deadline)
+    #   * a soft 4.7-second deadline leaves margin below the 5-second limit;
+    #     setup and the final simulation are not preempted
     #
     # Tunables can be overridden from outside for benchmarking WITHOUT
     # editing this file (they default to the values below):
     #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA
 
     t0 = time.perf_counter()
-    TIME_LIMIT    = globals().get('MCTS_TIME_LIMIT', 4.7)
+    TIME_LIMIT    = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
     C_PUCT        = globals().get('MCTS_C_PUCT', 1.4)
     ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
     KAPPA         = globals().get('MCTS_KAPPA', 1.5)
     deadline = t0 + TIME_LIMIT
+    event_poll = globals().get('_MCTS_EVENT_POLL')
+    next_poll = t0
+
+    def keep_searching():
+        # Optional cooperative GUI cancellation; external callers need no Pygame
+        # display and never have their event queue consumed by best_move itself.
+        nonlocal next_poll
+        now = time.perf_counter()
+        if event_poll is not None and now >= next_poll:
+            next_poll = now + 0.03
+            if event_poll():
+                return False
+        return now < deadline
 
     n_rows, n_cols = state[0].shape
     n_cells = n_rows * n_cols
@@ -143,8 +157,6 @@ def best_move(state, color):
 
     # python-native flat copies: fast scalar access in the hot loops
     board_flat = np.asarray(state[0]).ravel().astype(int).tolist()
-    edgeH_l = np.asarray(state[1]).astype(bool).tolist()
-    edgeV_l = np.asarray(state[2]).astype(bool).tolist()
 
     # flat edge lists (for inlined lookups in the hot loops):
     #   ehF[r*(n_cols-1)+c] = edge (r,c)-(r,c+1)
@@ -199,123 +211,93 @@ def best_move(state, color):
                         nb.append((r + dr) * n_cols + (c + dc))
             neighbors8.append(tuple(nb))
 
-    def conn(r, c, dr, dc):
-        """Whether (r, c) and (r+dr, c+dc) are joined by an existing edge.
-        Diagonals are always connected."""
-        if dr == 0 and dc == 1:  return edgeH_l[r][c]
-        if dr == 0 and dc == -1: return edgeH_l[r][c - 1]
-        if dr == 1 and dc == 0:  return edgeV_l[r][c]
-        if dr == -1 and dc == 0: return edgeV_l[r - 1][c]
-        return True   # |dr| == 1 and |dc| == 1: diagonals
+    # Resolve connectivity once, not during every rollout/line walk.
+    # Each pair is (forward, backward), with -1 for a boundary or missing edge.
+    steps4 = [tuple((f if f >= 0 and (fe < 0 or edges[fe]) else -1,
+                     b if b >= 0 and (be < 0 or edges[be]) else -1)
+                    for _, _, f, fe, b, be in entries)
+              for entries in gates4]
+    connected_lines = []
+    windows5 = []
+    for d in range(4):
+        for a in range(n_cells):
+            if steps4[a][d][1] >= 0:
+                continue
+            line = []
+            i = a
+            while i >= 0:
+                line.append(i)
+                i = steps4[i][d][0]
+            connected_lines.append(tuple(line))
+            for k in range(len(line) - 4):
+                windows5.append((tuple(line[k:k + 5]),
+                                 line[k - 1] if k else -1,
+                                 line[k + 5] if k + 5 < len(line) else -1))
 
     def line_len(bd, r, c, dr, dc):
-        """Length of the maximal unbroken same-colour line through (r, c)
-        in direction (dr, dc), counting both ways (connectivity-aware)."""
-        color = bd[r * n_cols + c]
-        L = 1
-        rr, cc = r + dr, c + dc
-        while (0 <= rr < n_rows and 0 <= cc < n_cols
-               and bd[rr * n_cols + cc] == color
-               and conn(rr - dr, cc - dc, dr, dc)):
-            L += 1
-            rr += dr
-            cc += dc
-        rr, cc = r - dr, c - dc
-        while (0 <= rr < n_rows and 0 <= cc < n_cols
-               and bd[rr * n_cols + cc] == color
-               and conn(rr, cc, dr, dc)):
-            L += 1
-            rr -= dr
-            cc -= dc
-        return L
+        a = r * n_cols + c
+        pl = bd[a]
+        d = DIRS4.index((dr, dc))
+        length = 1
+        for side in (0, 1):
+            i = steps4[a][d][side]
+            while i >= 0 and bd[i] == pl:
+                length += 1
+                i = steps4[i][d][side]
+        return length
 
     def win_check(bd, a):
-        """Exact win check for the stone at flat index `a`, with a cheap
-        neighbour gate: a direction can only hold a line of >= 2 stones if
-        the immediate neighbour through a live connection is ours, so the
-        full two-way walk runs only for directions that pass the gate."""
-        color = bd[a]
-        r, c = divmod(a, n_cols)
-        for dr, dc, fnb, fe, bnb, be in gates4[a]:
-            fwd = fnb >= 0 and bd[fnb] == color and (fe < 0 or edges[fe])
-            bwd = bnb >= 0 and bd[bnb] == color and (be < 0 or edges[be])
-            if (fwd or bwd) and line_len(bd, r, c, dr, dc) == 5:
+        pl = bd[a]
+        if pl == 0:
+            return False
+        for d, (f, b) in enumerate(steps4[a]):
+            length = 1
+            while f >= 0 and bd[f] == pl:
+                length += 1
+                if length > 5:
+                    break
+                f = steps4[f][d][0]
+            if length > 5:
+                continue
+            while b >= 0 and bd[b] == pl:
+                length += 1
+                if length > 5:
+                    break
+                b = steps4[b][d][1]
+            if length == 5:
                 return True
         return False
 
-    def is_winning_move(bd, r, c):
-        """Whether the stone just placed at (r, c) completes an unbroken
-        line of exactly five stones (the game would be over)."""
-        return win_check(bd, r * n_cols + c)
+    def tactical_targets(bd, pl):
+        """Exact wins and a -> set of winning replies after playing a.
 
-    def run_extent(bd, r, c, dr, dc):
-        """For the maximal unbroken line of bd[r, c] through (r, c) along
-        (dr, dc), return (L, start, end): the length and the two extreme
-        cells of the run (start is the cell furthest along -d)."""
-        color = bd[r * n_cols + c]
-        s_r, s_c = r, c
-        br, bc = r - dr, c - dc
-        while (0 <= br < n_rows and 0 <= bc < n_cols
-               and bd[br * n_cols + bc] == color
-               and conn(br, bc, dr, dc)):
-            s_r, s_c = br, bc
-            br -= dr
-            bc -= dc
-        e_r, e_c = r, c
-        fr, fc = r + dr, c + dc
-        while (0 <= fr < n_rows and 0 <= fc < n_cols
-               and bd[fr * n_cols + fc] == color
-               and conn(e_r, e_c, dr, dc)):
-            e_r, e_c = fr, fc
-            fr += dr
-            fc += dc
-        # Chebyshev distance: for a horizontal step only |dc| grows and for a
-        # vertical step only |dr| grows, but for a diagonal BOTH grow by 1 per
-        # step.  The old dot product (e-s).(dr,dc) therefore counted diagonal
-        # runs twice (L=3 reported as 5), so no diagonal four was ever seen as
-        # a four by the threat layer.  max(|dr|,|dc|) is the true step count in
-        # all four directions.
-        L = max(abs(e_r - s_r), abs(e_c - s_c)) + 1
-        return L, (s_r, s_c), (e_r, e_c)
-
-    def four_threat_count(bd, a, pl):
-        """Exact number of distinct empty cells that become immediate winning
-        moves for `pl` after `pl` plays at flat index a.
-
-        Every candidate within four steps of `a` along the four lines through
-        `a` is validated by placing a stone and calling win_check.  This
-        rejects a "win" that would actually make a run of six (an overline,
-        which the rules do not count) and catches a broken four such as
-        ``X . X X X`` whose gap is the winning cell.  The old contiguous-run
-        counter missed both cases (and doubled diagonal lengths), so the
-        candidates are now validated directly.
-
-        Requires: `a` is empty and no win-in-1 cells for `pl` exist on `bd`
-        yet (both hold at the point of use: mine/theirs were handled first).
+        A connected five-window with three stones and two empties describes
+        both forcing moves at once, including broken fours. Boundary stones
+        of our colour invalidate a window: filling it would make an overline.
+        Sets deduplicate the same winning cell shared by different windows.
         """
-        r, c = divmod(a, n_cols)
-        bd[a] = pl
-        found = set()
-        for dr, dc in DIRS4:
-            cand = [(r + k * dr, c + k * dc)
-                    for k in (-4, -3, -2, -1, 1, 2, 3, 4)]
-            L, s, e = run_extent(bd, r, c, dr, dc)
-            if L >= 4:
-                # straight four: the classic two extension cells
-                cand.append((s[0] - dr, s[1] - dc))
-                cand.append((e[0] + dr, e[1] + dc))
-            for br, bc in cand:
-                if not (0 <= br < n_rows and 0 <= bc < n_cols):
-                    continue
-                b = br * n_cols + bc
-                if bd[b] != 0:
-                    continue
-                bd[b] = pl
-                if win_check(bd, b):
-                    found.add(b)
-                bd[b] = 0
-        bd[a] = 0
-        return len(found)
+        wins, targets = set(), {}
+        for cells, before, after in windows5:
+            if (before >= 0 and bd[before] == pl
+                    or after >= 0 and bd[after] == pl):
+                continue
+            empty = []
+            for a in cells:
+                v = bd[a]
+                if v == -pl:
+                    break
+                if v == 0:
+                    empty.append(a)
+                    if len(empty) > 2:
+                        break
+            else:
+                if len(empty) == 1:
+                    wins.add(empty[0])
+                elif len(empty) == 2:
+                    a, b = empty
+                    targets.setdefault(a, set()).add(b)
+                    targets.setdefault(b, set()).add(a)
+        return sorted(wins), targets
 
     class Node:
         """Search-tree node.  Edge statistics (N, W, Q) are stored on the
@@ -338,7 +320,6 @@ def best_move(state, color):
 
     def create_child(node, a):
         """Apply action `a` for node's player to move; return the child."""
-        r, c = divmod(a, n_cols)
         bd = node.board[:]              # copy; the parent's board is reused
         bd[a] = node.player
         child = Node(bd, -node.player)
@@ -357,7 +338,11 @@ def best_move(state, color):
         scores = []
         for a in actions:
             r, c = divmod(a, n_cols)
-            s = 0.6 * sum(1 for j in neighbors8[a] if bd[j] != 0)
+            # Positive baseline keeps distant legal moves searchable; a small
+            # centre preference avoids the old bottom-right opening tie bias.
+            centre = (1.0 - abs(2 * r - n_rows + 1) / max(1, n_rows - 1)
+                      + 1.0 - abs(2 * c - n_cols + 1) / max(1, n_cols - 1))
+            s = 1.0 + 0.1 * centre + 0.6 * sum(1 for j in neighbors8[a] if bd[j] != 0)
             for pl, table in ((player, EXT_W), (-player, BLOCK_W)):
                 bd[a] = pl
                 for dr, dc in DIRS4:
@@ -405,7 +390,7 @@ def best_move(state, color):
         else:
             scores = [1.0 + 0.5 * sum(1 for j in neighbors8[a] if node.board[j] != 0)
                       for a in actions]
-        total = sum(scores) + 1e-9
+        total = sum(scores) + len(scores) * 1e-9
         node.prior = {a: (s + 1e-9) / total for a, s in zip(actions, scores)}
         # ascending by prior, so that list.pop() yields the best-prior action
         node.untried = [a for _, a in sorted(zip(scores, actions))]
@@ -443,74 +428,27 @@ def best_move(state, color):
         threats, it is not a tactical guarantee -- forced lines are handled by
         the hard rules and by the search.
 
-        The per-direction edge lookups are inlined (ehF/evF) instead of
-        going through conn(): this loop runs once per simulation."""
+        Connected geometry is precomputed: this loop uses only flat Python
+        list accesses, without coordinate arithmetic or edge lookups."""
         sb = sw = 0.0
-        for i in range(n_cells):
-            v = bd[i]
-            if v == 0:
-                continue
-            r, c = divmod(i, n_cols)
-            for dr, dc in DIRS4:
-                br = r - dr
-                bc = c - dc
-                if (0 <= br < n_rows and 0 <= bc < n_cols) \
-                        and bd[br * n_cols + bc] == v:
-                    # behind cell is the same colour: this is the start of a
-                    # line only if the connecting edge is missing
-                    if dr == 0:
-                        if ehF[br * ncm1 + (bc if dc == 1 else bc - 1)]:
-                            continue
-                    elif dc == 0:
-                        if evF[(br if dr == 1 else br - 1) * n_cols + bc]:
-                            continue
-                    else:
-                        continue    # diagonal behind: always connected
-                L = 1
-                rr, cc = r, c
-                while True:
-                    fr = rr + dr
-                    fc = cc + dc
-                    if not (0 <= fr < n_rows and 0 <= fc < n_cols) \
-                            or bd[fr * n_cols + fc] != v:
-                        break
-                    # edge between (rr,cc) and (fr,fc) -- belongs to (rr,cc)
-                    if dr == 0:
-                        linked = ehF[rr * ncm1 + (cc if dc == 1 else cc - 1)]
-                    elif dc == 0:
-                        linked = evF[(rr if dr == 1 else rr - 1) * n_cols + cc]
-                    else:
-                        linked = True
-                    if not linked:
-                        break
-                    L += 1
-                    rr, cc = fr, fc
-                if L < 2:
+        for line in connected_lines:
+            k, size = 0, len(line)
+            while k < size:
+                v = bd[line[k]]
+                if v == 0:
+                    k += 1
                     continue
-                # playable ends: an empty cell just beyond each extreme
-                # of the run, reachable through an existing edge
-                ends = 0
-                er = r - dr
-                ec = c - dc
-                if 0 <= er < n_rows and 0 <= ec < n_cols \
-                        and bd[er * n_cols + ec] == 0:
-                    if dr == 0:
-                        ends += ehF[er * ncm1 + (ec if dc == 1 else ec - 1)]
-                    elif dc == 0:
-                        ends += evF[(er if dr == 1 else er - 1) * n_cols + ec]
-                    else:
-                        ends += 1
-                er = rr + dr
-                ec = cc + dc
-                if 0 <= er < n_rows and 0 <= ec < n_cols \
-                        and bd[er * n_cols + ec] == 0:
-                    if dr == 0:
-                        ends += ehF[rr * ncm1 + (cc if dc == 1 else cc - 1)]
-                    elif dc == 0:
-                        ends += evF[(rr if dr == 1 else rr - 1) * n_cols + cc]
-                    else:
-                        ends += 1
-                w = (L - 1) ** 2 * (1.0 + KAPPA * ends)
+                start = k
+                k += 1
+                while k < size and bd[line[k]] == v:
+                    k += 1
+                length = k - start
+                # Overlines are NOT strong threats in this exact-five game.
+                if length < 2 or length > 5:
+                    continue
+                ends = int(start > 0 and bd[line[start - 1]] == 0)
+                ends += int(k < size and bd[line[k]] == 0)
+                w = (length - 1) ** 2 * (1.0 + KAPPA * ends)
                 if v == 1:
                     sb += w
                 else:
@@ -523,61 +461,56 @@ def best_move(state, color):
         """Depth-capped random playout; returns the value from the
         perspective of the player to move at `node`."""
         bd = node.board[:]            # scratch copy
-        empties = list(node.empties)  # copy; pop mutates it (shifts the tail)
+        empties = list(node.empties)  # scratch copy for swap/pop removal
         to_move = node.player
         draw_value = 1.0 if node.player == WHITE else -1.0
         for _ in range(ROLLOUT_DEPTH):
             if not empties:
                 return draw_value     # draw: White wins
-            a = empties.pop(int(next_rand() * len(empties)))
+            k = int(next_rand() * len(empties))
+            a = empties[k]
+            empties[k] = empties[-1]  # O(1) removal instead of shifting the tail
+            empties.pop()
             bd[a] = to_move
             if win_check(bd, a):
                 return 1.0 if to_move == node.player else -1.0
             to_move = -to_move
+        # The last allowed ply can fill the board: do not statically evaluate
+        # that draw (which is a White win) as a nonterminal position.
+        if not empties:
+            return draw_value
         return static_eval(bd, node.player)
 
     # ---- hard tactical rules at the root (cheap, and they save time) ----
     empties0 = [i for i in range(n_cells) if board_flat[i] == 0]
     if not empties0:
-        return (0, 0)                 # game already over (defensive)
+        raise ValueError('best_move requires at least one empty point')
     if len(empties0) == 1:
         return divmod(empties0[0], n_cols)
 
-    def winning_cells(pl):
-        out = []
-        for a in empties0:
-            r, c = divmod(a, n_cols)
-            board_flat[a] = pl
-            if is_winning_move(board_flat, r, c):
-                out.append(a)
-            board_flat[a] = 0
-        return out
-
-    mine = winning_cells(color)
+    mine, my_targets = tactical_targets(board_flat, color)
     if mine:
-        return divmod(mine[0], n_cols)      # win immediately
-    theirs = winning_cells(-color)
+        return divmod(mine[0], n_cols)
+    theirs, their_targets = tactical_targets(board_flat, -color)
     if theirs:
-        # if the opponent can win next move, every other move loses: block
         root_actions = theirs
     else:
-        # ---- open-four threat layer (one ply earlier than win-in-1) ----
-        # M: cells where OUR stone creates >= 2 win-in-1 cells -- an open
-        #    four.  This is a forced win: the opponent cannot outrace two
-        #    win-in-1 cells with a single reply.
-        # O: cells where THEIR stone creates >= 2 win-in-1 cells -- if they
-        #    get to play one, we lose by force.
-        # F: cells where OUR stone creates >= 1 win-in-1 cell -- a forcing
-        #    four ("fight threes with fours"): they must answer or lose.
-        # Any move outside M | F | O loses by force when O != empty, so the
-        # search is restricted to M | F | O; M itself wins outright.
-        M = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 2]
-        if M:
-            return divmod(M[0], n_cols)
-        O = [a for a in empties0 if four_threat_count(board_flat, a, -color) >= 2]
-        if O:
-            F = [a for a in empties0 if four_threat_count(board_flat, a, color) >= 1]
-            root_actions = sorted(set(F) | set(O))
+        forks = [a for a, targets in my_targets.items() if len(targets) >= 2]
+        if forks:
+            return divmod(min(forks), n_cols)
+        opponent_forks = {a: targets for a, targets in their_targets.items()
+                          if len(targets) >= 2}
+        if opponent_forks:
+            # A quiet defence may occupy the launch cell OR one of its two
+            # winning endpoints. Restricting to launch cells alone discards
+            # legal defences, especially against broken/diagonal threats.
+            safe = set(empties0)
+            for a, targets in opponent_forks.items():
+                safe.intersection_update({a} | (targets if len(targets) == 2 else set()))
+            # A forcing four gains tempo and must also remain searchable.
+            root_actions = sorted(safe | set(my_targets))
+            if not root_actions:  # already lost: still choose a legal resistance
+                root_actions = sorted(opponent_forks)
         else:
             root_actions = empties0
     if len(root_actions) == 1:
@@ -588,7 +521,7 @@ def best_move(state, color):
     root.empties = empties0         # full empty set (root_actions may be a subset)
     expand(root, root_actions, rich=True)
 
-    while time.perf_counter() < deadline:
+    while keep_searching():
         node, path = root, []
         while True:
             if node.terminal_value is not None:
@@ -660,64 +593,50 @@ def check_result(state):
         You can write between the two rows of #.
     """
     ###########################################################################
-
     board, edgeH, edgeV = state
-    n_rows, n_cols = board.shape
+    rows, cols = board.shape
+    # Python scalar indexing avoids NumPy overhead in the small nested loops.
+    cells, h, v = board.tolist(), edgeH.tolist(), edgeV.tolist()
 
-    def connected(r, c, dr, dc):
-        """Whether (r, c) and (r+dr, c+dc) are connected.
+    def continues_line(r, c, nr, nc, color):
+        # Test bounds before indexing; negative NumPy indices would wrap.
+        if not (0 <= nr < rows and 0 <= nc < cols):
+            return False
+        if cells[nr][nc] != color:
+            return False
 
-        Horizontal/vertical connections exist only where the corresponding
-        edge was initialized; a missing edge breaks the line.  Diagonal
-        connections always exist (even though no diagonal lines are drawn).
-        """
-        if dr == 0 and dc == 1:
-            return edgeH[r, c]
-        if dr == 1 and dc == 0:
-            return edgeV[r, c]
-        return True
+        # Horizontal edges belong to the left cell, vertical edges to the upper cell.
+        if r == nr:
+            return h[r][min(c, nc)]
+        if c == nc:
+            return v[min(r, nr)][c]
+        return True  # Adjacent diagonal points are always connected.
 
-    # A win is an UNBROKEN line of EXACTLY five stones of the same colour:
-    #   * stones separated by empty points do not count (Figure 3)
-    #   * a line of six or more connected stones does not count (Figure 4)
-    #   * horizontally/vertically, consecutive stones must be joined by an
-    #     existing edge, otherwise the line is broken (Figure 5)
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        for r in range(n_rows):
-            for c in range(n_cols):
-                color = board[r, c]
-                if color == 0:
+        for r in range(rows):
+            for c in range(cols):
+                color = cells[r][c]
+                # Skip empty cells and any cell that is not the start of its run.
+                if color == 0 or continues_line(r, c, r - dr, c - dc, color):
                     continue
 
-                # only start counting at the beginning of a line
-                pr, pc = r - dr, c - dc
-                if (0 <= pr < n_rows and 0 <= pc < n_cols
-                        and board[pr, pc] == color
-                        and connected(pr, pc, dr, dc)):
-                    continue
-
-                # measure the length of the line starting at (r, c)
                 length = 1
-                rr, cc = r, c
-                while True:
-                    nr, nc = rr + dr, cc + dc
-                    if not (0 <= nr < n_rows and 0 <= nc < n_cols):
-                        break
-                    if board[nr, nc] != color:
-                        break
-                    if not connected(rr, cc, dr, dc):
-                        break
+                end_r, end_c = r, c
+                while continues_line(end_r, end_c, end_r + dr, end_c + dc, color):
                     length += 1
-                    rr, cc = nr, nc
+                    end_r += dr
+                    end_c += dc
 
+                # Count the entire connected run so six in a row cannot win.
                 if length == 5:
-                    winning_line = np.array([[r + i * dr, c + i * dc]
-                                             for i in range(5)], dtype=int)
+                    winning_line = np.array(
+                        [(r + i * dr, c + i * dc) for i in range(5)], dtype=int
+                    )
                     return True, winning_line
 
-    # no more empty points: the game ends in a draw (no winning line)
-    if np.all(board != 0):
-        return True, np.ones((5, 2)) * -1
+    # Check for a draw only after ruling out a win on the last empty point.
+    if not np.any(board == 0):
+        return True, np.full((5, 2), -1.0)
 
     ###########################################################################
     return False, np.ones((5, 2)) * -1
@@ -758,81 +677,89 @@ def main(human_color):
     previous_move = None # after the first move, it stores the position
                          # (r, c) at which a stone has just been placed
     
-    ###########################################################################
+    ###########################################################################   
+    self_play = abs(human_color) != 1
+    current_color = +1
+    clock = pg.time.Clock()
+    missing_poll = object()
 
-    # Any human_color other than +1/-1 means there is no human player:
-    # the computer plays against itself (optional task).
-    human = human_color if human_color in (+1, -1) else 0
-
-    current = +1  # Black always moves first
-
-    def end_turn(r, c):
-        """Place the move at (r, c), redraw the previous stone without its
-        highlighted border, then check the result and update the flags."""
-        nonlocal current, gameover, congratulated, previous_move
-
-        color = board[r, c]
-
-        # remove the highlight border from the previous move (if any)
+    def commit_move(r, c):
+        nonlocal current_color, gameover, congratulated, previous_move
+        board[r, c] = current_color
         if previous_move is not None:
             pr, pc = previous_move
-            draw_stone(surface, pr, pc, board[pr, pc], highlight=False)
-
-        # draw the new stone with a highlighted border
-        draw_stone(surface, r, c, color, highlight=True)
+            draw_stone(surface, pr, pc, board[pr, pc])
+        draw_stone(surface, r, c, current_color, highlight=True)
         previous_move = (r, c)
-
-        # check whether the game has ended after this move
-        over, winning_line = check_result(state)
-        if over:
-            gameover = True
-            congratulated = True
-
+        gameover, winning_line = check_result(state)
+        if gameover:
             if np.all(winning_line == -1):
-                print_result(surface, 0)  # draw
+                # Keep the detector's draw sentinel, but award the game to
+                # White as required by the rules (Black moved first).
+                print_result(surface, -1)
             else:
-                winner = board[winning_line[0, 0], winning_line[0, 1]]
+                first_r, first_c = winning_line[0]
+                winner = board[first_r, first_c]
+                for win_r, win_c in winning_line:
+                    draw_stone(surface, win_r, win_c, winner, highlight=True)
                 print_result(surface, winner)
-                for rr, cc in winning_line:  # highlight the winning five stones
-                    draw_stone(surface, rr, cc, winner, highlight=True)
+            congratulated = True
         else:
-            current = -current  # switch players
+            current_color = -current_color
 
-    while running:                   # this double loop handles
-        for event in pg.event.get(): # all events you initiate
+    def poll_during_search():
+        nonlocal running
+        # All clicks during an AI turn are stale. Consume them, but honour
+        # QUIT promptly instead of waiting for the full search budget.
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                running = False
+        return not running
 
-            if event.type == pg.QUIT: # detects whether you
-                running = False       # try to close the window
+    try:
+        while running:
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    running = False
+                    break
+                if (event.type == pg.MOUSEBUTTONDOWN and event.button == 1
+                        and not gameover and not self_play
+                        and current_color == human_color):
+                    x, y = event.pos
+                    r = round((y - PAD_y) / SEP_y)
+                    c = round((x - PAD_x) / SEP_x)
+                    if (0 <= r < NUM_OF_ROWS and 0 <= c < NUM_OF_COLS
+                            and board[r, c] == 0):
+                        commit_move(r, c)
 
-            if (event.type == pg.MOUSEBUTTONDOWN   # a click during the human's
-                and not gameover                   # turn is only accepted while
-                and human != 0                     # the game is not over and
-                and current == human):             # the window is unlocked
-
-                x, y = event.pos # the position at which you click
-                                 # (0, 0) is the top left corner of the window
-
-                r = round( (y-PAD_y) / SEP_y )
-                c = round( (x-PAD_x) / SEP_x )
-
-                # the click must land on a valid, empty grid point
-                if (0 <= r < NUM_OF_ROWS and 0 <= c < NUM_OF_COLS
+            if (running and not gameover
+                    and (self_play or current_color != human_color)):
+                # The optional hook keeps best_move usable by an external master
+                # program; restore any pre-existing hook even on an exception.
+                old_poll = globals().get('_MCTS_EVENT_POLL', missing_poll)
+                globals()['_MCTS_EVENT_POLL'] = poll_during_search
+                try:
+                    r, c = best_move(state, current_color)
+                finally:
+                    if old_poll is missing_poll:
+                        globals().pop('_MCTS_EVENT_POLL', None)
+                    else:
+                        globals()['_MCTS_EVENT_POLL'] = old_poll
+                poll_during_search()
+                if not running:
+                    break
+                if not (isinstance(r, (int, np.integer))
+                        and isinstance(c, (int, np.integer))
+                        and 0 <= r < NUM_OF_ROWS and 0 <= c < NUM_OF_COLS
                         and board[r, c] == 0):
-                    board[r, c] = current
-                    end_turn(r, c)
+                    # Do not silently search forever if an engine violates its API.
+                    raise ValueError('best_move returned an illegal move')
+                commit_move(r, c)
 
-        # the computer's turn (also covers the computer-vs-itself mode,
-        # where human = 0 so every move is made by the computer)
-        if running and not gameover and current != human:
-            if human == 0:
-                pg.time.delay(300) # slow down the self-play animation
-
-            r, c = best_move(state, current)
-
-            # only accept a valid, empty point
-            if board[r, c] == 0:
-                board[r, c] = current
-                end_turn(r, c)
+            clock.tick(60)
+    except BaseException:
+        pg.quit()
+        raise
 
     ###########################################################################
     
