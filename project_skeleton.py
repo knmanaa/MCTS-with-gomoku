@@ -147,7 +147,11 @@ def best_move(state, color):
     # win, otherwise blocks an immediate loss, before choosing randomly.
     TACTIC_EPS    = min(1.0, max(0.0, float(globals().get('MCTS_TACTIC_EPS', 1.0))))
     GAP4_W        = max(0.0, float(globals().get('MCTS_GAP4_W', 30.0)))
+    # Soft budget: start no new simulation after 4.7 s.  Hard guard: an
+    # already-running descent/rollout is interrupted before 4.95 s, keeping
+    # the whole call inside the fixed 5 s limit even under CPU contention.
     deadline = t0 + TIME_LIMIT
+    hard_deadline = t0 + min(4.95, TIME_LIMIT + 0.25)
     event_poll = globals().get('_MCTS_EVENT_POLL')
     next_poll = t0
 
@@ -551,7 +555,12 @@ def best_move(state, color):
                         if bd[j] == 0 and not near_flag[j]:
                             near_flag[j] = 1
                             near.append(j)
-        for _ in range(ROLLOUT_DEPTH):
+        for ply in range(ROLLOUT_DEPTH):
+            # The soft budget stops new simulations; a simulation already in
+            # flight is abandoned if it would push the call past the hard
+            # 4.95 s guard.  No partial result is backed up.
+            if (ply & 3) == 0 and time.perf_counter() >= hard_deadline:
+                return None
             if not empties:
                 return draw_value     # draw: White wins
             chosen = -1
@@ -642,7 +651,11 @@ def best_move(state, color):
 
     while keep_searching():
         node, path = root, []
+        aborted = False
         while True:
+            if time.perf_counter() >= hard_deadline:
+                aborted = True
+                break
             if node.terminal_value is not None:
                 break                        # game already decided at `node`
             if node.children is None:            # first visit: expand
@@ -659,6 +672,8 @@ def best_move(state, color):
             path.append((node, a))
             node = node.children[a]
 
+        if aborted:
+            break
         # evaluation phase.  A freshly created child may already be terminal
         # (create_child sets terminal_value), so consult the node's own state
         # rather than a descent-time flag: otherwise a finished game would be
@@ -667,6 +682,8 @@ def best_move(state, color):
             v = node.terminal_value              # for the player to move here
         else:
             v = rollout(node)
+            if v is None:                        # hard-deadline abort
+                break
 
         # backpropagation: exactly one visit per traversed node.  The root is
         # counted once here; every traversed child is counted once below (the

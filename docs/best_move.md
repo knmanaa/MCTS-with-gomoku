@@ -250,6 +250,7 @@ REUSE = bool(globals().get('MCTS_REUSE', False))
 TACTIC_EPS = float(globals().get('MCTS_TACTIC_EPS', 1.0))
 GAP4_W = float(globals().get('MCTS_GAP4_W', 30.0))
 deadline = t0 + TIME_LIMIT
+hard_deadline = t0 + min(4.95, TIME_LIMIT + 0.25)
 ```
 
 | Module-level override | Default | Meaning |
@@ -275,11 +276,12 @@ exploration coefficient and evaluator weights have not been retuned after
 this review.
 
 The timer starts before setup, so preprocessing uses part of the budget.
-However, preprocessing and individual simulations are not preempted; the
-outer loop checks `keep_searching()` between simulations. The 4.7-second
-budget leaves nominal margin below the five-second project limit, but is
-**not a strict runtime guarantee** for arbitrary board sizes, pauses, or
-configurations. A zero budget still performs setup/tactical checks and returns
+The outer loop starts new simulations only while `keep_searching()` reports
+time before the 4.7 s soft deadline. A simulation already in flight is also
+polled inside rollout and descent against a fixed **4.95 s hard deadline**;
+if it crosses that guard, the partial simulation is discarded rather than
+backed up. This keeps the whole call inside the five-second rule while using
+the 4.7 s window as fully as possible. A zero budget still performs setup/tactical checks and returns
 a tactical move or the highest-prior fallback.
 
 ### Cooperative GUI cancellation
@@ -1187,6 +1189,14 @@ A combined check under `KAPPA = 2.0` at 0.5 s (16 games per configuration)
 was also unfavourable: control 10–6, `KAPPA=2.0 + reuse` 6–10,
 `KAPPA=2.0 + tactical` 2–14, and both together 4–12. There is no evidence
 that a tunable combination rescues these features.
+
+A **safe-only fork-defence** candidate (`root_actions = safe`) was also
+tested. It is equivalent to `safe | (my_targets & safe)`, so options 1 and 2
+produce the same action set. At the production budget it was **16–16 over 32
+games**, while the current `safe | my_targets` rule was **17–15** in the same
+run. At 0.5 s safe-only was clearly worse (12–20 vs 18–14). The current union
+is retained because it preserves counter-forcing tempo and is at least as
+good at 4.7 s.
 
 The tactical shortcut tests the empty cells adjacent to existing stones for
 an exact-five win, then for the opponent's exact-five threat. This is exact,
