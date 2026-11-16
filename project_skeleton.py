@@ -129,7 +129,7 @@ def best_move(state, color):
     # Tunables can be overridden from outside for benchmarking WITHOUT
     # editing this file (they default to the values below):
     #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA,
-    #   MCTS_PW_MIN, MCTS_PW_C
+    #   MCTS_PW_MIN, MCTS_PW_C, MCTS_REUSE, MCTS_TACTIC_EPS, MCTS_GAP4_W
 
     t0 = time.perf_counter()
     TIME_LIMIT    = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
@@ -141,6 +141,12 @@ def best_move(state, color):
     # remain eligible; this delays low-prior branches instead of deleting them.
     PW_MIN        = max(1, int(globals().get('MCTS_PW_MIN', 6)))
     PW_C          = max(0.0, float(globals().get('MCTS_PW_C', 2.0)))
+    REUSE         = bool(globals().get('MCTS_REUSE', False))
+    # Probability that a rollout ignores the tactical shortcut.  1.0 keeps
+    # the original uniformly random playout; 0.0 always takes an immediate
+    # win, otherwise blocks an immediate loss, before choosing randomly.
+    TACTIC_EPS    = min(1.0, max(0.0, float(globals().get('MCTS_TACTIC_EPS', 1.0))))
+    GAP4_W        = max(0.0, float(globals().get('MCTS_GAP4_W', 30.0)))
     deadline = t0 + TIME_LIMIT
     event_poll = globals().get('_MCTS_EVENT_POLL')
     next_poll = t0
@@ -172,6 +178,8 @@ def best_move(state, color):
     ehF = np.asarray(state[1]).astype(bool).ravel().tolist()
     evF = np.asarray(state[2]).astype(bool).ravel().tolist()
     edges = ehF + evF                   # gate table indices point into this
+    reuse_key = (n_rows, n_cols, tuple(ehF), tuple(evF),
+                 C_PUCT, ROLLOUT_DEPTH, KAPPA, PW_MIN, PW_C, TACTIC_EPS)
 
     def _edge_idx(r, c, dr, dc):
         """Index into `edges` for the edge (r,c)->(r+dr,c+dc); -1 = diagonal."""
@@ -337,9 +345,36 @@ def best_move(state, color):
             child.terminal_value = 1.0 if child.player == WHITE else -1.0
         return child
 
-    def rich_scores(bd, player, actions):
+    def reuse_root_for(actions):
+        """Find the old node matching this exact state, if reusable.
+
+        The cache stores the node after our previous move.  A real opponent
+        move must then match one of that node's children.  Board, shape,
+        edge topology, player, and the active search configuration are all
+        checked before any old statistics are trusted.
+        """
+        if not REUSE:
+            return None
+        cache = globals().get('_MCTS_REUSE_CACHE')
+        if not isinstance(cache, dict) or cache.get('key') != reuse_key:
+            return None
+        previous = cache.get('node')
+        if previous is None or previous.children is None:
+            return None
+        wanted = set(actions)
+        for child in previous.children.values():
+            if (child.player == color
+                    and child.terminal_value is None
+                    and child.board == board_flat
+                    and (child.prior is None or set(child.prior) == wanted)):
+                return child
+        return None
+
+    def rich_scores(bd, player, actions, own_targets=None, opp_targets=None):
         """Heuristic scores for the root prior: urgency of extending own
-        lines / occupying cells the opponent wants, plus stone proximity."""
+        lines / occupying cells the opponent wants, plus stone proximity.
+        Moves that create a win-in-1 threat (including an internal-gap broken
+        four) and moves that deny such a setup to the opponent get a bonus."""
         EXT_W   = {2: 2.0, 3: 8.0, 4: 30.0}
         BLOCK_W = {2: 1.0, 3: 4.0, 4: 20.0}
         scores = []
@@ -355,10 +390,14 @@ def best_move(state, color):
                 for dr, dc in DIRS4:
                     s += table.get(line_len(bd, r, c, dr, dc), 0.0)
                 bd[a] = 0
+            if own_targets:
+                s += 20.0 * len(own_targets.get(a, ()))
+            if opp_targets:
+                s += 15.0 * len(opp_targets.get(a, ()))
             scores.append(s)
         return scores
 
-    def expand(node, actions, rich):
+    def expand(node, actions, rich, own_targets=None, opp_targets=None):
         """Create the action set of `node` with heuristic priors P(s, a)."""
         if actions is None:
             actions = node.empties   # set at creation; no rescan needed
@@ -393,7 +432,8 @@ def best_move(state, color):
                     if blocks:
                         actions = blocks
         if rich:
-            scores = rich_scores(node.board, node.player, actions)
+            scores = rich_scores(node.board, node.player, actions,
+                                 own_targets, opp_targets)
         else:
             scores = [1.0 + 0.5 * sum(1 for j in neighbors8[a] if node.board[j] != 0)
                       for a in actions]
@@ -455,6 +495,7 @@ def best_move(state, color):
         sb = sw = 0.0
         for line in connected_lines:
             k, size = 0, len(line)
+            prev_v = prev_len = prev_end = 0
             while k < size:
                 v = bd[line[k]]
                 if v == 0:
@@ -465,6 +506,18 @@ def best_move(state, color):
                 while k < size and bd[line[k]] == v:
                     k += 1
                 length = k - start
+                # A broken four such as XX.XX is one empty gap between two
+                # same-colour runs totalling four stones.  It is absent from
+                # the contiguous-run terms below, yet placing at the gap wins
+                # immediately.  An extra same-colour stone would make the
+                # total five, so this check accepts only exact-five patterns.
+                if (prev_v == v and start == prev_end + 2
+                        and prev_len + length == 4):
+                    if v == 1:
+                        sb += GAP4_W
+                    else:
+                        sw += GAP4_W
+                prev_v, prev_len, prev_end = v, length, k - 1
                 # Overlines are NOT strong threats in this exact-five game.
                 if length < 2 or length > 5:
                     continue
@@ -486,14 +539,49 @@ def best_move(state, color):
         empties = list(node.empties)  # scratch copy for swap/pop removal
         to_move = node.player
         draw_value = 1.0 if node.player == WHITE else -1.0
+        near = []
+        near_flag = None
+        if TACTIC_EPS < 1.0:
+            # Every exact-five completion touches a stone.  Track empty
+            # neighbours incrementally so tactical rollout checks stay local.
+            near_flag = bytearray(n_cells)
+            for i, v in enumerate(bd):
+                if v:
+                    for j in neighbors8[i]:
+                        if bd[j] == 0 and not near_flag[j]:
+                            near_flag[j] = 1
+                            near.append(j)
         for _ in range(ROLLOUT_DEPTH):
             if not empties:
                 return draw_value     # draw: White wins
-            k = int(next_rand() * len(empties))
-            a = empties[k]
+            chosen = -1
+            if near_flag is not None and near and next_rand() >= TACTIC_EPS:
+                # Prefer our immediate win; otherwise block theirs.
+                for pl in (to_move, -to_move):
+                    for b in near:
+                        if bd[b] == 0:
+                            bd[b] = pl
+                            if win_check(bd, b):
+                                chosen = b
+                                bd[b] = 0
+                                break
+                            bd[b] = 0
+                    if chosen >= 0:
+                        break
+            if chosen >= 0:
+                a = chosen
+                k = empties.index(a)
+            else:
+                k = int(next_rand() * len(empties))
+                a = empties[k]
             empties[k] = empties[-1]  # O(1) removal instead of shifting the tail
             empties.pop()
             bd[a] = to_move
+            if near_flag is not None:
+                for j in neighbors8[a]:
+                    if bd[j] == 0 and not near_flag[j]:
+                        near_flag[j] = 1
+                        near.append(j)
             if win_check(bd, a):
                 return 1.0 if to_move == node.player else -1.0
             to_move = -to_move
@@ -539,9 +627,18 @@ def best_move(state, color):
         return divmod(root_actions[0], n_cols)
 
     # ---- PUCT-MCTS ----
-    root = Node(board_flat[:], color)
-    root.empties = empties0         # full empty set (root_actions may be a subset)
-    expand(root, root_actions, rich=True)
+    root = reuse_root_for(root_actions)
+    if root is not None:
+        root.empties = [i for i, v in enumerate(root.board) if v == 0]
+        if root.prior is None:
+            expand(root, root_actions, rich=True)
+        elif root.children:
+            root.prior_mass = sum(root.prior[a] for a in root.children)
+    else:
+        root = Node(board_flat[:], color)
+        root.empties = empties0     # full empty set (root_actions may be a subset)
+        expand(root, root_actions, rich=True,
+               own_targets=my_targets, opp_targets=their_targets)
 
     while keep_searching():
         node, path = root, []
@@ -594,6 +691,16 @@ def best_move(state, color):
     if best_a is None:
         # no simulation completed: fall back to the best-prior action
         best_a = root.untried[-1]
+
+    if REUSE and best_a in root.children:
+        after_our_move = root.children[best_a]
+        if after_our_move.terminal_value is None:
+            globals()['_MCTS_REUSE_CACHE'] = {
+                'key': reuse_key, 'node': after_our_move}
+        else:
+            globals().pop('_MCTS_REUSE_CACHE', None)
+    else:
+        globals().pop('_MCTS_REUSE_CACHE', None)
 
     ###########################################################################
     return divmod(best_a, n_cols)

@@ -246,6 +246,9 @@ ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
 KAPPA = globals().get('MCTS_KAPPA', 1.5)
 PW_MIN = globals().get('MCTS_PW_MIN', 6)
 PW_C = globals().get('MCTS_PW_C', 2.0)
+REUSE = bool(globals().get('MCTS_REUSE', False))
+TACTIC_EPS = float(globals().get('MCTS_TACTIC_EPS', 1.0))
+GAP4_W = float(globals().get('MCTS_GAP4_W', 30.0))
 deadline = t0 + TIME_LIMIT
 ```
 
@@ -257,11 +260,14 @@ deadline = t0 + TIME_LIMIT
 | `MCTS_KAPPA` | `1.5` | Playable-end weight in the static evaluator |
 | `MCTS_PW_MIN` | `6` | Minimum admitted children per expanded node |
 | `MCTS_PW_C` | `2.0` | Square-root growth coefficient for widening |
+| `MCTS_REUSE` | `False` | Enable module-local subtree reuse when the exact reply was explored |
+| `MCTS_TACTIC_EPS` | `1.0` | Probability a rollout ignores immediate-win/block tactics (`1.0` = off) |
+| `MCTS_GAP4_W` | `30.0` | Static-evaluator weight for an internal-gap broken four such as `XX.XX` |
 
 The widening defaults were selected from paired experiments summarised in
 [Section 9](<#9-integration-review-measured-results-and-verification>). They
-are implementation defaults, not a claim of global optimality; the full
-4.7-second budget was not used for the tuning matches.
+are implementation defaults, not a claim of global optimality. A larger
+full-budget validation is reported later in that section.
 
 Overrides can be assigned by an external caller without editing the function.
 Use suitable numeric values and a nonnegative integer rollout depth. The
@@ -876,6 +882,45 @@ segments. Geometry is already connected, so this census needs no per-step
 coordinate arithmetic or edge lookups. Splitting a geometric line at a
 missing edge also makes the playable-end rule natural.
 
+### Internal-gap broken fours
+
+The run census above misses a key one-move pattern: `XX.XX` is two short
+runs, not one four. Yet placing at the gap completes an exact five. The same
+applies to `X.XXX` and `XXX.X`. Define `G4_x(s)` as the number of pairs of
+maximal same-colour runs of colour `x` on one connected line that are
+separated by **exactly one** empty cell and whose lengths sum to four:
+
+$$
+G4_x(s)=\left|\{(\lambda_1,\lambda_2):
+\text{same colour }x,\ \text{one empty between them},\
+L_{\lambda_1}+L_{\lambda_2}=4\}\right|.
+$$
+
+The static evaluator adds
+
+$$
+\Phi_x(s)\;+\!=\;\Gamma_4\,G4_x(s),\qquad \Gamma_4=\texttt{MCTS\_GAP4\_W}=30.
+$$
+
+This is deliberately computed during the same run scan: only adjacent runs
+with one empty between them are paired, so the cost is linear in the line
+length and there is no separate five-window pass. An internal-gap broken four
+is an immediate win-in-1 and receives a value comparable to an open four
+(36), but the exact tactical layer still has priority.
+
+If filling the gap would produce six stones, the two runs contain five
+stones in total (or the adjacent run continues through a connected stone), so
+`G4_x` does **not** count it. If a missing edge separates the runs, they are
+not in the same `connected_line`, so they are not paired. End-gap fours such
+as `XXXX.` are already handled by the ordinary four-run term and are not
+double-counted here.
+
+The root prior also rewards moves that create a win-in-1 target
+(`my_targets`) and moves that deny such a target to the opponent
+(`their_targets`) with weights 20 and 15 respectively. This gives
+gap-creating setups such as placing at one end of `X.XX` a normal chance in
+the search even before the exact threat becomes a terminal position.
+
 ### Why squared length and openness?
 
 The two factors express different approximations:
@@ -1015,8 +1060,9 @@ budget against the immediately preceding integration HEAD observed:
 A simulation that descends deeper is not equivalent to a shallower one, so raw
 simulation count is only a diagnostic. The extra depth is exactly the intended
 trade. Zero-budget setup remained approximately 5 ms in this measurement.
-Full-budget probes stayed around 4.73–4.75 seconds, inside the five-second
-rule on this machine. These are observations, not hardware-independent
+Single-process full-budget probes stayed around 4.73–4.80 seconds. In the
+parallel 24-game run one late-game move reached 5.024 s; see the timing caveat
+below. These are observations, not hardware-independent
 guarantees; a strict deadline remains cooperative rather than preemptive.
 
 Earlier v1–v4 timing and match results describe historical engines and budgets.
@@ -1034,6 +1080,8 @@ They must not be presented as measurements of this build.
 | Long runs | Exact-five/overline probes for lengths 4, 5, 6, 7, 20, and 100 passed |
 | Backup and priors | Root visit accounting, `Q = W/N`, and normalised updated priors passed |
 | Progressive widening | Audited width bounds, `prior_mass`, untried/child partition, and root visit count on three positions and four seeds; all passed |
+| Internal-gap tactical checks | `XX.XX` wins were taken in all four axes for both colours; missing-edge and overline cases were rejected |
+| Gap-aware evaluation | `XX.XX` and one-run-one-gap variants score above 0.5; `XX.X` remains low; static-eval throughput cost about 6–8% at 0.5 s |
 | GUI integration | Close during actual search, stale-click rejection, one-time result, draw award, and error cleanup passed |
 
 The review-specific differential and GUI checks were executed in memory;
@@ -1056,45 +1104,123 @@ game is one independent result; “draws” are awarded to White by the rules.
 | 0.08 s | Root eager, deeper widening (`6`, `2.0`) | 16 | 7 | 9 |
 | 0.5 s | `k_min = 6`, `k = 2.0` (default) | 8 | 5 | 3 |
 | 0.5 s | `k_min = 6`, `k = 2.5` | 8 | 4 | 4 |
+| 4.7 s (preliminary) | `k_min = 6`, `k = 2.0` | 8 | 3 | 5 |
+| **4.7 s (larger fresh run)** | `k_min = 6`, `k = 2.0` | **24** | **18** | **6** |
 
 The low-budget wins are substantial, and a root-eager variant was rejected
 because it spent too much of a small budget broadening the root without
-enough depth. At the 0.5-second budget the advantage shrinks to a small,
-statistically weak sample. The **full 4.7-second deployment budget was not
-played out in this review**, so no claim is made that widening improves
-full-budget strength. The default reflects the stronger low/mid-budget tests
-and the desire to deepen tactical lines; users can restore eager expansion
-with a very large `MCTS_PW_MIN`, or tune `MCTS_PW_C`, and rerun paired matches.
+enough depth. At 0.5 seconds the advantage shrinks to a small, statistically
+weak sample. The first full-budget sample (8 games, 3–5) was inconclusive.
+
+The larger fresh full-budget run used **12 new board seeds**, both colours,
+and 24 games at 4.7 s/move. Widening won **18–6 (75%)**:
+
+- **As Black:** 8–4; **as White:** 10–2.
+- Seed pairs: **7 sweeps**, **4 splits**, **1 pair lost 2–0**.
+- Wilson 95% confidence interval for the game win rate: **55.1%–88.0%**.
+- Exact two-sided binomial test against a 50% null: **p = 0.0227**.
+- Two games reached 221 plies and were draws awarded to White. Excluding
+  those draw-rule games leaves **17–5**; they contributed one widening win
+  and one loss because widening held each colour in one game.
+
+This is moderate but useful statistical evidence that widening is better than
+eager expansion at the deployment budget. It is not a claim of a specific Elo
+gain: the 24-game interval is wide, and a modest positive effect remains
+plausible even below the observed 75%. The default remains `k_min = 6`,
+`k = 2.0`; eager expansion can be restored with a very large `MCTS_PW_MIN`.
+
+One timing caveat: the 24-game run executed 12 games in parallel. One
+late-game move in a 221-ply game took **5.024 s**, slightly over the five-second
+limit under that CPU contention; other moves stayed near 4.74 s. A
+single-process full-budget probe is the correct final timing check. The
+deadline is cooperative between simulations, so a final simulation or a GC
+pause can overshoot.
 
 Wall-clock-limited games can diverge even under identical random seeds because
 finite search budgets are not deterministic. The table reports actual games,
-not a theoretical Elo estimate; confidence intervals for these sample sizes are
-wide. Future validation should include more seeds at 4.7 seconds and both
-opening and midgame positions.
+not a theoretical Elo estimate. More seeds, balanced openings, and a
+single-process timing run would tighten the interval further.
 
-## 10. Recommended next work — not implemented
+### Tunable re-screen under progressive widening
 
-1. **Cheap tactical rollouts:** prefer immediate wins and necessary blocks
-   before random choices. Measure whether lower rollout noise offsets the
-   extra per-ply work; retain some exploration.
-2. **Full-budget widening validation:** run paired, colour-swapped matches at
-   the production budget and compare the default, eager expansion, and slower
-   widening schedules. Tune `k_min` and `k` only after that measurement.
-3. **Tree reuse:** retain the matching subtree after real moves, validating
-   board, topology, colour, and dimensions before reuse. No tree is currently
-   reused between calls.
-4. **Incremental evaluation:** update only affected lines and threat windows
-   instead of rescanning all connected lines at each cutoff. Validate against
-   the independent exact-five references before performance tuning.
-5. **Finer deadline checks:** add cooperative checks inside expensive setup,
+The old tuning settlement (before progressive widening) recommended
+`C_PUCT = 1.4`, `KAPPA = 1.5`, and `ROLLOUT_DEPTH = 32`. Because widening
+changes tree shape, these were re-screened against the current default at
+0.5 s and then at the full budget.
+
+| Stage | Games/configuration | Main outcomes |
+| --- | ---: | --- |
+| 0.5 s screen | 32 | Control 12–20; `KAPPA=2.0` 19–13; `C_PUCT=1.0` 18–14; `C_PUCT=1.6` 15–17; depth 24 15–17; depth 40 13–19. The control variance shows the screen was noisy. |
+| 4.7 s validation | 16 | Control 8–8; `C_PUCT=1.0` 9–7; `KAPPA=2.0` 9–7; `C_PUCT=1.6, KAPPA=2.0, depth=40` 10–6. |
+
+No candidate separated from the default reliably. The 10–6 full-budget
+candidate has a Wilson interval of roughly 39%–82% and its 0.5 s screen was
+17–15, so changing the defaults on this evidence would be overfitting to a
+small sample. The recommended settings remain:
+
+```python
+MCTS_C_PUCT = 1.4
+MCTS_KAPPA = 1.5
+MCTS_ROLLOUT_DEPTH = 32
+MCTS_PW_MIN = 6
+MCTS_PW_C = 2.0
+MCTS_REUSE = False
+MCTS_TACTIC_EPS = 1.0
+```
+
+A larger full-budget settlement would be needed before changing any of
+`C_PUCT`, `KAPPA`, or rollout depth. In particular, the apparent `KAPPA=2.0`
+gain at 0.5 s (19–13) did not reproduce strongly at 4.7 s (9–7).
+
+### Optional experiments evaluated
+
+These features were implemented or prototyped and tested, but are **off by
+default** because the evidence did not justify changing production behaviour.
+
+| Feature | Default | Main observation |
+| --- | --- | --- |
+| Cheap tactical rollouts | `MCTS_TACTIC_EPS = 1.0` (off) | At 0.08 s: mid-tactical `8–8`, always-tactical `7–9`, mostly-tactical `2–14`. Throughput fell from about 2,693 to 254/96 simulations/s for the tested schedules. |
+| Tree reuse | `MCTS_REUSE = False` | Reuses only a matching explored opponent reply after validating board, topology, player, and search configuration. At 0.08 s it went `9–7`; at 0.5 s `3–5`; a full-budget opening sample had no reuse hit. No robust gain. |
+| Incremental evaluation | Not integrated | A local line-delta prototype reproduced the full evaluator on a random sweep, but 32 per-ply updates cost more than one full evaluator call (~0.16 ms); it would add work, not remove it. |
+
+A combined check under `KAPPA = 2.0` at 0.5 s (16 games per configuration)
+was also unfavourable: control 10–6, `KAPPA=2.0 + reuse` 6–10,
+`KAPPA=2.0 + tactical` 2–14, and both together 4–12. There is no evidence
+that a tunable combination rescues these features.
+
+The tactical shortcut tests the empty cells adjacent to existing stones for
+an exact-five win, then for the opponent's exact-five threat. This is exact,
+but scanning those candidates on every rollout ply is expensive. The
+implementation retains the option; the random rollout remains the default.
+
+Tree reuse stores the node after the chosen move and, on the next call, looks
+for the actual opponent reply among that node's explored children. A mismatch
+discards the cache. The public `best_move` API has no tree-handle argument, so
+this is necessarily a module-local optimisation; it is disabled by default to
+keep calls independent.
+
+Incremental evaluation is mathematically promising because placing one stone
+only changes the four connected lines through it, and only the runs touching
+that cell or its playable ends. However, local run bookkeeping per rollout ply
+adds more Python work than the current one-pass cutoff evaluator. It should be
+revisited only after profiling on a larger board or with a different runtime.
+
+## 10. Remaining work
+
+1. **Widening follow-up:** the larger 4.7-second run is **18–6** over 24 games
+   (Wilson 95% CI 55–88%). Keep `k_min = 6`, `k = 2.0` as the working default;
+   collect more balanced-opening games and tune `k_min`/`k` only if a larger
+   sample shows a consistent gain. Recheck single-process move time after the
+   parallel run's 5.024 s outlier.
+2. **Finer deadline checks:** add cooperative checks inside expensive setup,
    descent, or rollout phases if larger boards require them. Never interpret
    an interrupted partial tactical map as a certified complete threat set.
-6. **Retuning and maintained tests:** remeasure `C_PUCT`, depth, and weights
+3. **Retuning and maintained tests:** remeasure `C_PUCT`, depth, and weights
    after correctness/expansion changes, using paired matches rather than
    random opponents alone. Preserve regressions for diagonals with no H/V
    edges, broken threes, live-boundary overlines, missing-edge exact fives,
-   last-ply draws, normalised priors, widening invariants, and backup
-   perspective/counts.
+   last-ply draws, normalised priors, widening invariants, tree-reuse metadata,
+   and backup perspective/counts.
 
-All proposed search changes remain classical MCTS variants or handcrafted
-heuristics; none requires deep learning or additional production imports.
+All search changes remain classical MCTS variants or handcrafted heuristics;
+none requires deep learning or additional production imports.
