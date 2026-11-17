@@ -115,7 +115,8 @@ def best_move(state, color):
     #     evaluation function at the cutoff
     # PUCT selection, sign-alternating backup, and the final most-visited
     # root action follow the standard scheme.  Expansion uses prior-guided
-    # progressive widening: low-prior branches are deferred, never deleted.
+    # progressive widening: low-prior branches in the candidate set are
+    # deferred. Quiet opening roots first restrict candidates to a local area.
     #
     # Game-specific points:
     #   * a line of EXACTLY five stones wins, and consecutive stones must be
@@ -129,11 +130,14 @@ def best_move(state, color):
     # editing this file (they default to the values below):
     #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA,
     #   MCTS_PW_MIN, MCTS_PW_C, MCTS_REUSE, MCTS_TACTIC_EPS, MCTS_GAP4_W,
-    #   MCTS_DYNAMIC_TIME (False restores fixed-budget search)
+    #   MCTS_DYNAMIC_TIME (False restores fixed-budget search),
+    #   MCTS_OPENING_LOCAL, MCTS_OPENING_PRIOR (opening ablation switches)
 
     t0 = time.perf_counter()
     TIME_LIMIT    = min(4.8, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 1.6))))
     DYNAMIC_TIME  = bool(globals().get('MCTS_DYNAMIC_TIME', True))
+    OPENING_LOCAL = bool(globals().get('MCTS_OPENING_LOCAL', True))
+    OPENING_PRIOR = bool(globals().get('MCTS_OPENING_PRIOR', True))
     budget = TIME_LIMIT
     iterations = 0
     stop_reason = 'tactical'
@@ -219,7 +223,8 @@ def best_move(state, color):
     evF = np.asarray(state[2]).astype(bool).ravel().tolist()
     edges = ehF + evF                   # gate table indices point into this
     reuse_key = (n_rows, n_cols, tuple(ehF), tuple(evF),
-                 C_PUCT, ROLLOUT_DEPTH, KAPPA, PW_MIN, PW_C, TACTIC_EPS)
+                 C_PUCT, ROLLOUT_DEPTH, KAPPA, PW_MIN, PW_C, TACTIC_EPS,
+                 GAP4_W, OPENING_LOCAL, OPENING_PRIOR)
 
     def _edge_idx(r, c, dr, dc):
         """Index into `edges` for the edge (r,c)->(r+dr,c+dc); -1 = diagonal."""
@@ -417,14 +422,30 @@ def best_move(state, color):
         four) and moves that deny such a setup to the opponent get a bonus."""
         EXT_W   = {2: 2.0, 3: 8.0, 4: 30.0}
         BLOCK_W = {2: 1.0, 3: 4.0, 4: 20.0}
+        opening = OPENING_PRIOR and sum(v != 0 for v in bd) <= 8
+        potential = [0.0] * n_cells
+        if opening:
+            # Count genuinely connected five-cell windows, not geometric
+            # lines across missing edges. Mixed-colour windows help neither.
+            for cells, before, after in windows5:
+                for pl, weight in ((player, 0.15), (-player, 0.10)):
+                    if (any(bd[i] == -pl for i in cells)
+                            or before >= 0 and bd[before] == pl
+                            or after >= 0 and bd[after] == pl):
+                        continue
+                    for i in cells:
+                        if bd[i] == 0:
+                            potential[i] += weight
         scores = []
         for a in actions:
             r, c = divmod(a, n_cols)
-            # Positive baseline keeps distant legal moves searchable; a small
-            # centre preference avoids the old bottom-right opening tie bias.
+            # Every admitted candidate keeps a positive prior. The opening
+            # root uses a local candidate set; later roots use all empties.
             centre = (1.0 - abs(2 * r - n_rows + 1) / max(1, n_rows - 1)
                       + 1.0 - abs(2 * c - n_cols + 1) / max(1, n_cols - 1))
-            s = 1.0 + 0.1 * centre + 0.6 * sum(1 for j in neighbors8[a] if bd[j] != 0)
+            nearby = sum(1 for j in neighbors8[a] if bd[j] != 0)
+            s = (1.0 + (0.4 if opening else 0.1) * centre
+                 + (1.8 if opening else 0.6) * nearby + potential[a])
             for pl, table in ((player, EXT_W), (-player, BLOCK_W)):
                 bd[a] = pl
                 for dr, dc in DIRS4:
@@ -489,7 +510,8 @@ def best_move(state, color):
 
         width(N) = min(|A|, max(PW_MIN, floor(PW_C * sqrt(N + 1)))).  The
         square-root growth lets visits deepen promising lines first, while
-        every legal action remains eligible once the budget is large enough.
+        every action in the node's candidate set remains eligible once the
+        budget is large enough (opening roots deliberately use a local set).
         """
         return min(len(node.prior), max(PW_MIN, int(PW_C * (node.N + 1) ** 0.5)))
 
@@ -668,6 +690,30 @@ def best_move(state, color):
                 root_actions = sorted(opponent_forks)
         else:
             root_actions = empties0
+            occupied_cells = [i for i, v in enumerate(board_flat) if v != 0]
+            if OPENING_LOCAL and not occupied_cells:
+                # Empty opening: search the central 2x2/3x3 region, deriving
+                # its coordinates from the actual board dimensions.
+                root_actions = [a for a in empties0
+                                if abs(2 * (a // n_cols) - n_rows + 1) <= 2
+                                and abs(2 * (a % n_cols) - n_cols + 1) <= 2]
+            elif OPENING_LOCAL and len(occupied_cells) <= 8:
+                # Opening locality is a strategy, not a legality rule.
+                # All global wins, blocks and forks above take precedence.
+                radius = 1 if len(occupied_cells) <= 2 else 2
+                nearby = set()
+                for a in occupied_cells:
+                    r, c = divmod(a, n_cols)
+                    for rr in range(max(0, r - radius), min(n_rows, r + radius + 1)):
+                        for cc in range(max(0, c - radius), min(n_cols, c + radius + 1)):
+                            b = rr * n_cols + cc
+                            if board_flat[b] == 0:
+                                nearby.add(b)
+                # Include every known forcing-four setup/denial even if it
+                # lies outside the local region. Never restrict node.empties.
+                root_actions = sorted(nearby | set(my_targets) | set(their_targets))
+            if not root_actions:
+                root_actions = empties0
     if len(root_actions) == 1:
         return finish(root_actions[0])
 
