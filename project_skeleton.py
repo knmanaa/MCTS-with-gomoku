@@ -123,16 +123,30 @@ def best_move(state, color):
     #     always connected (same rule as check_result, cf. Figures 2-5)
     #   * a draw counts as a win for White (rules, section 1)
     #   * the input state is never modified
-    #   * a soft 4.7-second deadline leaves margin below the 5-second limit;
-    #     setup and the final simulation are not preempted
+    #   * adaptive soft budget, with a cooperative guard below five seconds
     #
     # Tunables can be overridden from outside for benchmarking WITHOUT
     # editing this file (they default to the values below):
     #   MCTS_TIME_LIMIT, MCTS_C_PUCT, MCTS_ROLLOUT_DEPTH, MCTS_KAPPA,
-    #   MCTS_PW_MIN, MCTS_PW_C, MCTS_REUSE, MCTS_TACTIC_EPS, MCTS_GAP4_W
+    #   MCTS_PW_MIN, MCTS_PW_C, MCTS_REUSE, MCTS_TACTIC_EPS, MCTS_GAP4_W,
+    #   MCTS_DYNAMIC_TIME (False restores fixed-budget search)
 
     t0 = time.perf_counter()
-    TIME_LIMIT    = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
+    TIME_LIMIT    = min(4.8, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 1.6))))
+    DYNAMIC_TIME  = bool(globals().get('MCTS_DYNAMIC_TIME', True))
+    budget = TIME_LIMIT
+    iterations = 0
+    stop_reason = 'tactical'
+
+    def finish(action):
+        # Optional diagnostics only: neither callers nor future moves depend
+        # on these statistics. They include setup and tactical scanning time.
+        globals()['_MCTS_LAST_STATS'] = {
+            'elapsed': time.perf_counter() - t0, 'budget': budget,
+            'iterations': iterations, 'reason': stop_reason,
+            'extensions': extensions,
+        }
+        return divmod(action, n_cols)
     C_PUCT        = globals().get('MCTS_C_PUCT', 1.4)
     ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
     KAPPA         = globals().get('MCTS_KAPPA', 1.5)
@@ -147,24 +161,46 @@ def best_move(state, color):
     # win, otherwise blocks an immediate loss, before choosing randomly.
     TACTIC_EPS    = min(1.0, max(0.0, float(globals().get('MCTS_TACTIC_EPS', 1.0))))
     GAP4_W        = max(0.0, float(globals().get('MCTS_GAP4_W', 30.0)))
-    # Soft budget: start no new simulation after 4.7 s.  Hard guard: an
-    # already-running descent/rollout is interrupted before 4.95 s, keeping
-    # the whole call inside the fixed 5 s limit even under CPU contention.
+    # Cooperative deadlines cannot preempt Python or OS scheduling. Leave
+    # margin below the assignment's five-second wall-clock limit.
     deadline = t0 + TIME_LIMIT
-    hard_deadline = t0 + min(4.95, TIME_LIMIT + 0.25)
+    hard_deadline = t0 + min(4.9, TIME_LIMIT + 0.05)
     event_poll = globals().get('_MCTS_EVENT_POLL')
     next_poll = t0
+    extensions = 0
+    max_budget = budget
+    root = None
 
     def keep_searching():
         # Optional cooperative GUI cancellation; external callers need no Pygame
         # display and never have their event queue consumed by best_move itself.
-        nonlocal next_poll
+        nonlocal next_poll, deadline, hard_deadline, budget, extensions, stop_reason
         now = time.perf_counter()
         if event_poll is not None and now >= next_poll:
             next_poll = now + 0.03
             if event_poll():
+                stop_reason = 'cancelled'
                 return False
-        return now < deadline
+        if now < deadline:
+            return True
+        # Spend more time only if the initial search has not separated the
+        # leading candidates. A threat by itself is not a reason to wait.
+        if DYNAMIC_TIME and root is not None and budget < max_budget:
+            ranked = sorted(root.children.values(), key=lambda ch: (ch.N, ch.Q),
+                            reverse=True)
+            confident = (iterations >= 96 and len(ranked) >= 2
+                         and ranked[0].N >= 1.6 * max(1, ranked[1].N)
+                         and ranked[0].Q >= ranked[1].Q + 0.04)
+            if confident:
+                stop_reason = 'clear-leader'
+                return False
+            if now < t0 + max_budget:
+                budget = min(max_budget, budget + 0.15)
+                deadline = t0 + budget
+                hard_deadline = t0 + min(4.9, budget + 0.05)
+                extensions += 1
+                return now < deadline
+        return False
 
     n_rows, n_cols = state[0].shape
     n_cells = n_rows * n_cols
@@ -558,7 +594,7 @@ def best_move(state, color):
         for ply in range(ROLLOUT_DEPTH):
             # The soft budget stops new simulations; a simulation already in
             # flight is abandoned if it would push the call past the hard
-            # 4.95 s guard.  No partial result is backed up.
+            # current budget's overrun guard. No partial result is backed up.
             if (ply & 3) == 0 and time.perf_counter() >= hard_deadline:
                 return None
             if not empties:
@@ -605,18 +641,18 @@ def best_move(state, color):
     if not empties0:
         raise ValueError('best_move requires at least one empty point')
     if len(empties0) == 1:
-        return divmod(empties0[0], n_cols)
+        return finish(empties0[0])
 
     mine, my_targets = tactical_targets(board_flat, color)
     if mine:
-        return divmod(mine[0], n_cols)
+        return finish(mine[0])
     theirs, their_targets = tactical_targets(board_flat, -color)
     if theirs:
         root_actions = theirs
     else:
         forks = [a for a, targets in my_targets.items() if len(targets) >= 2]
         if forks:
-            return divmod(min(forks), n_cols)
+            return finish(min(forks))
         opponent_forks = {a: targets for a, targets in their_targets.items()
                           if len(targets) >= 2}
         if opponent_forks:
@@ -633,7 +669,26 @@ def best_move(state, color):
         else:
             root_actions = empties0
     if len(root_actions) == 1:
-        return divmod(root_actions[0], n_cols)
+        return finish(root_actions[0])
+
+    # Short initial search, extended only while candidates remain ambiguous.
+    # A three-stone threat often leaves just two sensible defences: that is
+    # a SMALL decision, not grounds for spending the full time allowance.
+    if DYNAMIC_TIME:
+        occupied = n_cells - len(empties0)
+        if len(root_actions) <= 4:
+            initial, maximum = 0.18, 0.45
+        elif occupied <= 8:
+            initial, maximum = 0.20, 0.55
+        else:
+            initial, maximum = 0.35, 1.6
+        budget = min(TIME_LIMIT, initial)
+        max_budget = min(TIME_LIMIT, maximum)
+    else:
+        max_budget = TIME_LIMIT
+    deadline = t0 + budget
+    hard_deadline = t0 + min(4.9, budget + 0.05)
+    stop_reason = 'budget'
 
     # ---- PUCT-MCTS ----
     root = reuse_root_for(root_actions)
@@ -649,6 +704,8 @@ def best_move(state, color):
         expand(root, root_actions, rich=True,
                own_targets=my_targets, opp_targets=their_targets)
 
+    stable_action, stable_checks = None, 0
+    next_stability_check = t0 + 0.15
     while keep_searching():
         node, path = root, []
         aborted = False
@@ -691,6 +748,7 @@ def best_move(state, color):
         # counted twice while values were summed once -- which distorted Q and
         # the PUCT exploration term).  The sign flips at every level.
         root.N += 1
+        iterations += 1
         v = -v
         for pnode, a in reversed(path):
             ch = pnode.children[a]
@@ -698,6 +756,25 @@ def best_move(state, color):
             ch.W += v
             ch.Q = ch.W / ch.N
             v = -v
+
+        # Stability is a speed heuristic, not a proof or confidence interval.
+        # Require fresh work even with reuse; tactical positions can stop too.
+        now = time.perf_counter()
+        if (DYNAMIC_TIME and iterations >= 96
+                and now >= next_stability_check):
+            next_stability_check = now + 0.08
+            ranked = sorted(root.children.items(),
+                            key=lambda item: (item[1].N, item[1].Q), reverse=True)
+            if len(ranked) >= 2:
+                action, leader = ranked[0]
+                runner = ranked[1][1]
+                dominant = (leader.N >= 1.8 * max(1, runner.N)
+                            and leader.Q >= runner.Q + 0.08)
+                stable_checks = stable_checks + 1 if dominant and action == stable_action else 0
+                stable_action = action
+                if stable_checks >= 3:
+                    stop_reason = 'stable'
+                    break
 
     # final move: most-visited root child (tau -> 0); tie-break by Q
     best_a, best_key = None, None
@@ -720,7 +797,7 @@ def best_move(state, color):
         globals().pop('_MCTS_REUSE_CACHE', None)
 
     ###########################################################################
-    return divmod(best_a, n_cols)
+    return finish(best_a)
 
 ### TODO
 def check_result(state):
