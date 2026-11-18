@@ -4,8 +4,9 @@ This guide develops the ideas behind `best_move(state, color)`: what the
 search estimates, how its four phases cooperate, why its values change sign,
 and how exact-five tactics and handcrafted heuristics adapt MCTS to this
 Gomoku variant. Equations describe the algorithm; implementation notes show
-how those equations map to the current `integration` working tree after the
-15 November 2026 review. Measurements and proposed extensions are kept
+how those equations map to `project_skeleton.py`, updated on
+**17 November 2026** after the adaptive-time and opening-policy changes.
+Measurements and proposed extensions are kept
 separate from the algorithm itself.
 
 The implementation is inside the function's existing TODO block in
@@ -16,15 +17,43 @@ The algorithm is **PUCT Monte Carlo tree search without deep learning**:
 
 | Component | Implementation |
 | --- | --- |
-| Policy prior | Handcrafted line-extension, blocking, proximity, and centre scores |
+| Policy prior | Line-extension/blocking scores; stronger opening proximity/centre scores and connected-five-window potential |
 | Leaf value | Depth-capped uniformly random rollout, then a static line evaluator |
 | Tree policy | Prior-guided progressive widening, then PUCT selection |
 | Backup | Alternating-sign backup with one visit per traversed edge |
 | Final decision | Most-visited root action; mean value breaks ties |
 | Tactical exceptions | Exact immediate wins, necessary replies, and root fork handling |
+| Time allocation | Short initial search, conditional extensions, and early stopping; default cap 1.6 s |
+| Quiet opening candidates | Central region on an empty board; local neighbourhood through eight occupied cells, with tactical exceptions |
 
-Progressive widening is enabled by default. Tactical rollout policies, tree
-reuse, and incremental value updates remain future work.
+Progressive widening, adaptive timing, and the new opening heuristics are enabled
+by default. Tactical rollout policies and tree reuse are implemented but disabled
+by default; incremental value updates remain proposed work.
+
+## Scope of the 17 November 2026 update
+
+Every change is inside `best_move`; the submitted program gains no new import.
+The work followed the reported problems in order:
+
+1. Replace the fixed 4.7 s budget with an adaptive one. The first adaptive
+   version still spent the full allowance whenever it saw a threat; that version
+   has been replaced.
+2. A three-stone defence in the opening waited too long, so the search now
+   starts short and extends only while the candidates remain hard to separate;
+   the default cap is 1.6 s.
+3. Early moves were sometimes far from the existing stones, so the root gained a
+   local candidate range and stronger proximity / connected-window scores.
+4. Full-board immediate wins, forced replies and the double-threat (fork) checks
+   were kept; opening ablation switches were added, together with the tests and
+   match tooling used to evaluate them.
+5. Independent calling, input immutability and different board shapes were
+   verified; the hardcoding review and the report scaffolding were documented
+   outside the engine file.
+
+Immediate wins/blocks, five-window threat detection, PUCT and progressive
+widening already existed in the integrated code; they are not new work from
+this round, and the new tactical experiments are not a full threat-space
+search. Section 9 separates current measurements from historical records.
 
 ## Algorithm overview and notation
 
@@ -240,22 +269,28 @@ of a missed diagonal block. Always distinguish it from a one-ended four.
 
 ```python
 t0 = time.perf_counter()
-TIME_LIMIT = min(4.7, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 4.7))))
+TIME_LIMIT = min(4.8, max(0.0, float(globals().get('MCTS_TIME_LIMIT', 1.6))))
+DYNAMIC_TIME = bool(globals().get('MCTS_DYNAMIC_TIME', True))
+OPENING_LOCAL = bool(globals().get('MCTS_OPENING_LOCAL', True))
+OPENING_PRIOR = bool(globals().get('MCTS_OPENING_PRIOR', True))
 C_PUCT = globals().get('MCTS_C_PUCT', 1.4)
 ROLLOUT_DEPTH = globals().get('MCTS_ROLLOUT_DEPTH', 32)
 KAPPA = globals().get('MCTS_KAPPA', 1.5)
-PW_MIN = globals().get('MCTS_PW_MIN', 6)
-PW_C = globals().get('MCTS_PW_C', 2.0)
+PW_MIN = max(1, int(globals().get('MCTS_PW_MIN', 6)))
+PW_C = max(0.0, float(globals().get('MCTS_PW_C', 2.0)))
 REUSE = bool(globals().get('MCTS_REUSE', False))
-TACTIC_EPS = float(globals().get('MCTS_TACTIC_EPS', 1.0))
-GAP4_W = float(globals().get('MCTS_GAP4_W', 30.0))
+TACTIC_EPS = min(1.0, max(0.0, float(globals().get('MCTS_TACTIC_EPS', 1.0))))
+GAP4_W = max(0.0, float(globals().get('MCTS_GAP4_W', 30.0)))
 deadline = t0 + TIME_LIMIT
-hard_deadline = t0 + min(4.95, TIME_LIMIT + 0.25)
+hard_deadline = t0 + min(4.9, TIME_LIMIT + 0.05)
 ```
 
 | Module-level override | Default | Meaning |
 | --- | --- | --- |
-| `MCTS_TIME_LIMIT` | `4.7` | Soft total budget, clamped to `[0, 4.7]` seconds |
+| `MCTS_TIME_LIMIT` | `1.6` | External soft-budget cap, clamped to `[0, 4.8]` seconds; dynamic position caps below can be smaller |
+| `MCTS_DYNAMIC_TIME` | `True` | Short initial search with conditional extensions; `False` uses the fixed external cap |
+| `MCTS_OPENING_LOCAL` | `True` | Enable the quiet-opening local candidate restriction |
+| `MCTS_OPENING_PRIOR` | `True` | Enable stronger opening proximity/centre scores and connected-window potential |
 | `MCTS_C_PUCT` | `1.4` | PUCT exploration coefficient |
 | `MCTS_ROLLOUT_DEPTH` | `32` | Maximum rollout plies before static evaluation |
 | `MCTS_KAPPA` | `1.5` | Playable-end weight in the static evaluator |
@@ -275,14 +310,86 @@ Use suitable numeric values and a nonnegative integer rollout depth. The
 exploration coefficient and evaluator weights have not been retuned after
 this review.
 
-The timer starts before setup, so preprocessing uses part of the budget.
-The outer loop starts new simulations only while `keep_searching()` reports
-time before the 4.7 s soft deadline. A simulation already in flight is also
-polled inside rollout and descent against a fixed **4.95 s hard deadline**;
-if it crosses that guard, the partial simulation is discarded rather than
-backed up. This keeps the whole call inside the five-second rule while using
-the 4.7 s window as fully as possible. A zero budget still performs setup/tactical checks and returns
-a tactical move or the highest-prior fallback.
+### Dynamic allocation: short search, then extend only when needed
+
+The old fixed 4.7-second default has been removed. The first adaptive attempt
+still assigned the full allowance whenever it found a threat, and disabled
+early stopping in such positions. That made a simple opening three-stone
+defence unnecessarily slow. The current policy uses **decision size and
+search evidence**, rather than treating any threat as a reason to wait.
+
+After global tactical checks and opening candidate selection, let `m` be the
+number of occupied cells and `A_root` the retained root candidates. Apply the
+first matching row:
+
+| Condition | Initial budget | Maximum dynamic budget |
+| --- | ---: | ---: |
+| `len(A_root) <= 4` | 0.18 s | 0.45 s |
+| Otherwise, `m <= 8` | 0.20 s | 0.55 s |
+| Otherwise | 0.35 s | 1.60 s |
+
+Both numbers are additionally capped by `TIME_LIMIT`. Immediate wins, detected
+own forks, the only empty cell, and a single retained root action still return
+directly. They do not wait for the initial budget.
+
+When the initial/current soft deadline is reached, `keep_searching()` ranks
+children by `(N, Q)`. It stops with `reason='clear-leader'` if at least **96
+new simulations** have completed, at least two children exist, and:
+
+$$
+N_1 \geq 1.6\max(1,N_2),\qquad Q_1 \geq Q_2+0.04.
+$$
+
+Otherwise it extends the budget by **0.15 s**, up to the position-specific
+maximum, if there is still time left. This test applies to threat positions
+too. Increasing the external cap above 1.6 s does not increase the current
+dynamic position maxima; use `MCTS_DYNAMIC_TIME=False` for a longer fixed
+budget experiment.
+
+There is also a repeated stability check during search. Starting no earlier
+than 0.15 s and after 96 fresh simulations, it checks approximately every
+0.08 s. A dominant leader must satisfy:
+
+$$
+N_1 \geq 1.8\max(1,N_2),\qquad Q_1 \geq Q_2+0.08.
+$$
+
+If that dominant action remains the same, `stable_checks` increments;
+otherwise it resets to zero. At `stable_checks >= 3`, search stops with
+`reason='stable'`. The first observation establishes the leader, so this is
+not simply three arbitrary samples. Both stopping rules are heuristics,
+**not statistical confidence bounds or proofs of the best move**.
+
+### Timing guards, fallback, and diagnostics
+
+All deadlines are measured from entry time `t0`, so setup and root tactical
+checks consume the budget too. After allocation or extension:
+
+```python
+deadline = t0 + budget
+hard_deadline = t0 + min(4.9, budget + 0.05)
+```
+
+The soft deadline controls new simulations; descent and rollout periodically
+check the overrun guard. An interrupted partial simulation is not backed up.
+These are cooperative checks: setup, individual operations, garbage collection,
+or OS scheduling cannot be preempted. The 0.05 s margin is not an absolute
+wall-clock guarantee. A zero budget still performs setup/tactical checks and
+returns a legal tactical or prior-based fallback when an empty cell exists.
+
+`finish()` publishes optional `_MCTS_LAST_STATS` diagnostics:
+
+| Field | Meaning |
+| --- | --- |
+| `elapsed` | Measured time from function entry, including setup |
+| `budget` | Current soft allowance; direct tactical returns may leave it at the external cap |
+| `iterations` | Newly completed simulations in this call, excluding reused visits |
+| `extensions` | Number of conditional budget extensions |
+| `reason` | `tactical`, `budget`, `clear-leader`, `stable`, or `cancelled` |
+
+`budget` also covers a search abandoned by the overrun guard; it is not a
+separate precise termination trace. Callers do not need the diagnostic global
+and later decisions do not depend on it.
 
 ### Cooperative GUI cancellation
 
@@ -292,7 +399,7 @@ often than approximately every 30 ms. A truthy return ends the search early.
 The ordinary legal-move fallback still applies if no simulation completed.
 
 The search itself does not consume Pygame events or require a display.
-[main](<main.md>) temporarily supplies the hook, discards AI-turn clicks,
+`main` temporarily supplies the hook, discards AI-turn clicks,
 honours QUIT, and restores the previous hook even on exceptions. Polling is
 cooperative: an expensive setup or single simulation can delay it.
 
@@ -409,7 +516,8 @@ precondition above.
    `|T_p(a)| >= 2`, return that fork. The opponent has no immediate win to
    race with and cannot occupy both distinct completion cells in one reply.
 4. Otherwise, handle opponent fork-launch moves as described below.
-5. If there are no opponent forks, retain all empty cells.
+5. If there are no opponent forks, apply the quiet-opening candidate policy
+   below; outside the opening (or with it disabled), retain all empty cells.
 6. Return a single remaining action directly; otherwise run PUCT-MCTS.
 
 ### Correct quiet defences against forks
@@ -467,7 +575,37 @@ statistics. `__slots__` avoids a per-node attribute dictionary.
 `create_child` copies the board, places the mover's stone, removes its index
 from the empty list, and assigns a terminal value when appropriate. Root
 `empties` always contains **all** empty cells, even when the root action set
-is tactically restricted; rollouts must still be allowed to use them.
+is restricted by tactics or opening locality; rollouts must still be allowed
+to use them.
+
+### Quiet-opening candidate policy
+
+The user observed that the computer's early moves could be far from the human's
+stones. The earlier proximity prior was weak, all empty points were searched,
+and the default random rollout could favour a distant action by chance.
+Shortening the time budget alone did not solve this strategic problem.
+
+The new root policy runs **after** global immediate-win, immediate-block and
+fork checks. With `MCTS_OPENING_LOCAL=True`:
+
+| Occupied cells | Root candidate policy in the non-forced branch |
+| --- | --- |
+| 0 | Central region: `abs(2*r-R+1) <= 2` and `abs(2*c-C+1) <= 2` |
+| 1–2 | Empty points within Chebyshev distance 1 of any existing stone |
+| 3–8 | Empty points within Chebyshev distance 2 of any existing stone |
+| More than 8 | All empty points |
+
+For 1–8 stones, union the local set with `set(my_targets)` and
+`set(their_targets)` so known forcing-four setup/denial moves remain searchable
+even outside that neighbourhood. If the candidate set is empty, fall back to
+all empty points. A rectangular board can have a 2×3 or 3×2 central region,
+as well as 2×2/3×3; coordinates always derive from the actual shape.
+
+Chebyshev distance is `max(abs(r-r0), abs(c-c0))`, so the neighbourhood includes
+diagonal positions. It is a **search heuristic, not a legality rule**: all empty
+points remain legal under the assignment. It is root-only, does not alter
+`node.empties`, and does not restrict rollout placements. It can omit a useful
+distant non-forcing opening move; strength needs paired-match evaluation.
 
 ### Root prior
 
@@ -480,8 +618,9 @@ $$
 \left|\{j\in\mathcal N_8(a):B_j\ne0\}\right|.
 $$
 
-Proximity encourages local play without permanently forbidding distant
-moves. The weak centre preference is
+Proximity scores the retained candidate set; with opening locality enabled,
+some distant non-forcing actions are deliberately excluded at the root.
+The dimension-derived centre score is
 
 $$
 h(r,c) = 1 - \frac{|2r-R+1|}{\max(1,R-1)}
@@ -492,10 +631,26 @@ Here `R` and `C` are board dimensions and `h` is the centre score. Combining
 proximity, centrality, attacking potential, and defensive urgency gives
 
 $$
-\operatorname{score}(s,a) = 1 + 0.1h(r,c) + 0.6\operatorname{occ}(s,a)
+\operatorname{score}(s,a) = 1 + \alpha h(r,c) + \beta\operatorname{occ}(s,a)
 + \sum_{d\in D}w_{\rm ext}(L_p(a,d))
-+ \sum_{d\in D}w_{\rm block}(L_{-p}(a,d)).
++ \sum_{d\in D}w_{\rm block}(L_{-p}(a,d))
++ \operatorname{potential}(a)+20|T_p(a)|+15|T_{-p}(a)|.
 $$
+
+When `MCTS_OPENING_PRIOR=True` and there are at most eight occupied cells,
+`alpha=0.4` and `beta=1.8`; otherwise they are `0.1` and `0.6`.
+Opening `potential(a)` counts usable precomputed connected five-cell windows
+containing `a`: add 0.15 per window for our colour, and 0.10 for the opponent.
+A window is usable for a colour only if it contains no opposing stone and
+neither connected outside boundary already contains that colour, which would
+make filling the window an overline. Potential is zero outside this opening
+mode. This scores actual edge topology rather than purely geometric lines.
+
+The `T` bonuses use the supplied target maps, with zero for a missing entry;
+they reward forcing-four setups and denying opponent setups, including gaps.
+New roots receive these maps. If a reused root needs fresh expansion, the
+current reuse path calls `expand(..., rich=True)` without target maps, so
+these two bonuses are absent there; reuse is disabled by default.
 
 Each length is measured after hypothetically placing the corresponding
 colour at `a`, then undoing that scratch-board placement.
@@ -524,9 +679,10 @@ Attacking and blocking scores therefore refer to two different hypothetical
 placements, not to both colours occupying the point simultaneously.
 Immediate wins are handled before these heuristic weights are needed.
 
-The positive baseline leaves distant legal moves searchable. The small
-centre preference removes the old bottom-right empty-board tie bias;
-it does not force the final searched move to be central.
+The positive baseline gives every retained candidate a nonzero prior; it
+does not restore actions removed by the root's local filter. The central
+candidate restriction on an empty board now makes the final searched move
+central; the centre score alone would only encourage it.
 Deeper nodes use a cheaper proximity-only score:
 
 $$
@@ -595,8 +751,9 @@ nonterminal node:
 The square-root schedule has the usual exploration curve: small visit counts
 buy depth, while later visits gradually widen to the remaining actions. The
 floor at `k_min` guarantees that a newly reached node has several candidate
-replies instead of a single deterministic branch. No action is permanently
-removed: it waits in `U(s)`.
+replies instead of a single deterministic branch. Within the retained `A(s)`,
+unadmitted actions wait in `U(s)`. This does not mean every legal action remains
+eligible: tactical filters and the new opening policy can restrict `A(s)`.
 
 For PUCT at a widened node, renormalise the priors over the children actually
 admitted:
@@ -1025,7 +1182,7 @@ The current algorithm uses a deterministic zero-temperature-style decision,
 not an actual sample from a positive-temperature distribution:
 
 $$
-a_{\rm final}=\underset{a:\,N(s_0,a)>0}{\arg\max}_{\rm lex}
+a_{\rm final}=\underset{a\in C(s_0)}{\arg\max}_{\rm lex}
 \bigl(N(s_0,a),Q(s_0,a)\bigr).
 $$
 
@@ -1034,14 +1191,137 @@ lucky playout is not enough to displace a more thoroughly investigated action
 with more visits. Most visits is still a practical decision rule, not a
 certificate of optimality.
 
-If no simulation completed, the visit distribution is undefined; the code
-instead returns a highest-prior action from `root.untried`. Direct tactical
-returns occur before either rule. Finally, `divmod(best_a, n_cols)` converts
+If no child was expanded, the code returns a highest-prior action from
+`root.untried`. If expansion happened but its simulation was interrupted,
+an existing zero-visit child can still be selected as a legal fallback; no
+partial value was backed up. Direct tactical returns occur before either
+rule. Finally, `divmod(best_a, n_cols)` converts
 the flat action index to `(r, c)`.
 
 ## 9. Integration review: measured results and verification
 
-### Runtime and widening tradeoff
+### Current maintained checks and measurements (17 November 2026)
+
+Validation is split into four different questions: rule correctness, interface
+independence, fixed-position latency, and full-game strength. **Tests passing,
+faster replies, and a higher win rate are three separate conclusions and do not
+substitute for one another.**
+
+| Current evidence | Result |
+| --- | --- |
+| Interface/opening regression | 85 calls passed: independent/import calls, immutable input, varied shapes/edges/colours, opening locality, defensive moves, cancellation/fallback |
+| Tactical regression | 14 fixtures × 2 colours × 2 seeds = 56 passes; independent coordinate-based referee |
+| Matched-position timing | Seeds 7 and 23, three 17×13 positions per seed; current dynamic vs the same engine with a fixed 1.6 s budget |
+| Opening-policy pilot | 9×11, seeds 7/23, 0.1 s cap, colour-swapped pairs: current 2 wins, no-opening 2 wins |
+| Tactical forcing (current build) | 613 sampled positions: 378/378 own immediate wins taken, 235/235 single-cell fours blocked; 62/62 forced blocks in live self-play games |
+| Self-play pattern audit | 23 decisive games at 1.6 s and 4.7 s/move: every game ended on an open four (two winning cells), none on a blockable single four |
+
+The timing sample measured:
+
+| Position | Dynamic elapsed | Fixed elapsed |
+| --- | ---: | ---: |
+| Empty board | 0.558–0.562 s | 1.625–1.627 s |
+| Reply to the first stone | 0.203–0.356 s | about 1.626 s |
+| Defend an open three | 0.183–0.457 s | 1.622–1.623 s |
+
+These are measured wall-clock times, not the configured soft targets. They
+demonstrate reduced latency on these positions, not a universal speed ratio.
+The four-game opening pilot kept dynamic timing enabled on both sides, but
+its 0.1 s cap was below every dynamic initial budget, so neither could extend
+its allowance. The two seed-7 games filled the board and were awarded to
+White. The **2–2 result does not establish a playing-strength improvement**.
+Both engines already had immediate-win/block and fork tactics; this was not
+a comparison against a pure, tactic-free MCTS engine.
+
+An additional two-game greedy-opponent smoke test at 0.05 s checked the match
+driver and `--fixed-budget` option; it was also 1–1. It is a tooling check,
+not evidence of competitive strength. Saved results can be overwritten by
+rerunning a command; retain a separate output path for experiments to cite.
+
+### Independent calling and hardcoding audit
+
+The interface check imports the module without calling `main` or initialising a
+Pygame window. It also extracts `best_move` with AST and executes it with only
+`np` and `time` supplied, verifying that the optional configuration, cache and
+GUI globals are not required.
+
+The script passes 1×1, 1×8, 8×1, 5×5, 7×11, 13×17, 17×13 and 23×19 boards,
+varies horizontal/vertical connectivity and player colour, checks that all
+three input arrays remain unchanged, and checks returned coordinates are
+in bounds and empty. A module-level row/column mismatch is deliberately
+introduced for an ordinary import test. A full board is rejected with
+`ValueError`, since no legal action exists.
+
+For code review, distinguish fixed **board assumptions** from rules/strategy
+constants: `range(17)`, `r*13+c`, or a fixed `(8,6)` centre would be suspect;
+the current engine uses `state[0].shape`, `n_cols` and shape-derived centres.
+The skeleton's top-level dimensions are legitimate parameter definitions;
+winning length 5, colours ±1, opening radii and search weights are not board
+dimension hardcoding. Finite tests support “no hardcoded dimensions found”,
+not a proof about all possible boards or past versions.
+
+The local Python 3.14 interface tests used pygame-ce via the `pygame` import;
+they did not constitute a fresh standard-Pygame GUI test. The tactics lab
+extracts the engine directly and needs NumPy rather than a GUI session.
+
+### Reproduce and extend the experiments
+
+The update round used a separate harness for interface verification, tactical
+fixtures, matched-position timing and colour-swapped matches. That harness is
+**not part of this repository** — only the engine file is — so the commands
+below describe what was run rather than a runnable path:
+
+```text
+verify   : import the module without calling main, call best_move on many
+           shapes/edge layouts/colours, assert unchanged inputs
+fixtures : board + edge arrays + allowed answer SET per case
+timing   : fixed positions, median of repeats, current vs a fixed budget
+match    : colour-swapped pairs, one profile per opponent, JSON after each game
+```
+
+Each saved run is a new experiment, not a reproduction of the earlier one.
+Time-bounded MCTS can take different moves under different CPU scheduling even
+with identical RNG seeds, and timed experiments must not run concurrently on
+the same CPU when latency is being compared.
+
+The profiles used to isolate the two changes are:
+
+| Opponent profile | Difference from `current` |
+| --- | --- |
+| `no-local` | Disable only `MCTS_OPENING_LOCAL` |
+| `no-prior` | Disable only `MCTS_OPENING_PRIOR` |
+| `no-opening` | Disable both new opening components |
+| `fixed` | Disable only dynamic timing |
+| `rollout` | Set tactical-rollout epsilon to 0.3 instead of 1.0 |
+| `original` | Load the earlier integrated backup; multiple features differ |
+| `random` / `greedy` | Baseline opponents, not MCTS ablations |
+
+Use a fixed budget on **both** sides when isolating a strategy change from time
+allocation. Do **not** use it when comparing `current` against `fixed` to
+evaluate adaptive timing, since then both sides would use fixed timing.
+`reuse_key` includes `MCTS_OPENING_LOCAL`, `MCTS_OPENING_PRIOR` and
+`MCTS_GAP4_W` as well as the prior configuration, so enabling optional reuse
+cannot silently retain statistics after changing these settings.
+
+When adding tactical fixtures, record the board, the edge arrays, the allowed
+answer **set**, and whether the case is an immediate win, unique block, fork,
+open-three defence or unavoidable double threat. Include negative examples for
+missing edges and overlines; never insist on a single coordinate if several are
+equally correct.
+
+The report scaffolding for the submission (personal contribution, division of
+labour, and the 0–5 peer-evaluation table) was updated alongside the timing and
+opening rules, but it remains a template with TODOs.
+
+### Historical integration results — not measurements of the updated policy
+
+**Everything from the next subsection through “Optional experiments evaluated”
+is retained from the earlier integration notes.** Its 4.7-second budgets,
+18–6 widening result, timing outlier, and in-memory correctness counts refer
+to previous versions. They were not rerun for the new dynamic/opening policy
+and must not be cited as current strength or performance validation.
+
+### Historical runtime and widening tradeoff
 
 The earlier scalar-access and exact-tactics review measured an end-to-end
 throughput gain over the pre-review integration code: approximately 22%, 16%,
@@ -1184,6 +1464,7 @@ default** because the evidence did not justify changing production behaviour.
 | Cheap tactical rollouts | `MCTS_TACTIC_EPS = 1.0` (off) | At 0.08 s: mid-tactical `8–8`, always-tactical `7–9`, mostly-tactical `2–14`. Throughput fell from about 2,693 to 254/96 simulations/s for the tested schedules. |
 | Tree reuse | `MCTS_REUSE = False` | Reuses only a matching explored opponent reply after validating board, topology, player, and search configuration. At 0.08 s it went `9–7`; at 0.5 s `3–5`; a full-budget opening sample had no reuse hit. No robust gain. |
 | Incremental evaluation | Not integrated | A local line-delta prototype reproduced the full evaluator on a random sweep, but 32 per-ply updates cost more than one full evaluator call (~0.16 ms); it would add work, not remove it. |
+| Root denial ranking / max coverage | Not integrated | Ranking the three denial cells (tempo, residual launch cells nearby, static value) and, when no single cell stops every fork, keeping the cells that cover the most forks. Colour-swapped pairs: `0.469` at 0.15 s and at 0.5 s (64 games each), `0.594` at a fixed 4.7 s (64 games, p = 0.126), `0.500` under the deployed dynamic policy (48 games). A single open three already has three equivalent denials, so the ordering added no reliable strength and was reverted. |
 
 A combined check under `KAPPA = 2.0` at 0.5 s (16 games per configuration)
 was also unfavourable: control 10–6, `KAPPA=2.0 + reuse` 6–10,
@@ -1217,20 +1498,35 @@ revisited only after profiling on a larger board or with a different runtime.
 
 ## 10. Remaining work
 
-1. **Widening follow-up:** the larger 4.7-second run is **18–6** over 24 games
-   (Wilson 95% CI 55–88%). Keep `k_min = 6`, `k = 2.0` as the working default;
-   collect more balanced-opening games and tune `k_min`/`k` only if a larger
-   sample shows a consistent gain. Recheck single-process move time after the
-   parallel run's 5.024 s outlier.
-2. **Finer deadline checks:** add cooperative checks inside expensive setup,
-   descent, or rollout phases if larger boards require them. Never interpret
-   an interrupted partial tactical map as a certified complete threat set.
-3. **Retuning and maintained tests:** remeasure `C_PUCT`, depth, and weights
-   after correctness/expansion changes, using paired matches rather than
-   random opponents alone. Preserve regressions for diagonals with no H/V
-   edges, broken threes, live-boundary overlines, missing-edge exact fives,
-   last-ply draws, normalised priors, widening invariants, tree-reuse metadata,
-   and backup perspective/counts.
+1. **Validate current strength:** expand the four-game opening pilot using
+   actual 17×13 boards, colour swaps, multiple opponents, and seeds withheld
+   from tuning. The current 2–2 pilot is inconclusive; historical widening
+   results do not establish the new opening policy's strength.
+2. **Widening follow-up (fixed budget):** the larger 4.7-second run was **18–6**
+   over 24 games (Wilson 95% CI 55–88%, p = 0.0227), so keep `k_min = 6`,
+   `k = 2.0` as the working default and collect more balanced-opening games
+   before tuning them. Recheck single-process move time after the parallel
+   run's 5.024 s outlier, and rerun the comparison under the adaptive default,
+   which has not been measured for widening.
+3. **Opening ablations:** compare `no-local`, `no-prior`, and `no-opening`
+   under matched fixed budgets. Separately compare deployed dynamic policies
+   to measure the practical speed/strength tradeoff. Locality may exclude a
+   valuable distant move, so inspect losses as well as average win rates.
+4. **Time-policy calibration:** test clear-leader/stability thresholds and
+   initial/maximum budgets on more positions. Extend cooperative checks into
+   costly setup if needed for larger boards; never interpret an interrupted
+   partial tactical map as a certified complete threat set.
+5. **Additional tactics, not yet implemented:** bounded continuous-four or
+   threat-space reply-sequence search could precede MCTS, but must validate
+   counter-wins, every relevant defence, missing edges and exact-five rules.
+   Returning “unknown” on timeout is required; a timeout is not a win proof.
+   The single open-three case is already denied heuristically; the open problem
+   is a fork count above one, where no single move can cover every launch cell.
+6. **Retuning and regressions:** test optional tactical rollouts and reuse at
+   current budgets, retaining the independent interface/tactical fixtures.
+   Recheck deeper backup, prior and widening invariants after structural
+   changes; this round's maintained tests do not repeat all historical
+   in-memory property checks or the GUI tests.
 
 All search changes remain classical MCTS variants or handcrafted heuristics;
 none requires deep learning or additional production imports.
